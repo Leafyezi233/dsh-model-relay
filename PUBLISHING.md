@@ -209,32 +209,45 @@ npm publish
 
 ### 2a. 建仓库并推代码
 
-在 GitHub 上新建**公开**仓库 `dsh-model-relay`（不要勾选 README/.gitignore/License，避免和本地冲突）。然后在你自己的终端里：
+**仓库 `qilin-zhu/dsh-model-relay` 已经建好了**（含一个 Apache-2.0 LICENSE 的 initial commit），本地也已经初始化 git 并对齐了远程历史，**只差最后一步 push**。
+
+本地当前状态：
+
+```
+98cf8b8  feat: 模型中转站 — OpenAI 兼容的模型中转接口   ← 待推送
+e1e3346  Initial commit                              ← 远程已有
+```
+
+所以**不要再 `git init`**（会破坏已有历史），直接推送即可：
 
 ```sh
 cd /vol2/@apphome/fn-deepseek-harness/profiles/日常/dsh-model-relay
-
-git init
-git add -A
-git commit -m "feat: 模型中转站 — OpenAI 兼容的模型中转接口"
-
-# 关联你的仓库并推送
-git branch -M main
-git remote add origin https://github.com/qilin-zhu/dsh-model-relay.git
-git push -u origin main
+git push origin main
 ```
 
 **推送时会要凭据**，不能用账号密码（GitHub 早就禁了）。两种方式：
 
-- **HTTPS + Personal Access Token**：密码处粘贴一个 token（GitHub → Settings → Developer settings → Personal access tokens → 勾 `repo` 权限）
+- **HTTPS + Personal Access Token**：用户名填 `qilin-zhu`，密码处粘贴一个 token（GitHub → Settings → Developer settings → Personal access tokens → 勾 `repo` 权限）
 - **SSH**：把公钥加到 GitHub，remote 换成 `git@github.com:qilin-zhu/dsh-model-relay.git`
 
-推完确认仓库根目录能打开、且 `package.json` 在根目录（**必须是 200**）：
+推完确认（**必须是 200**）：
 
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' \
   https://raw.githubusercontent.com/qilin-zhu/dsh-model-relay/main/package.json
 ```
+
+### 许可证：Apache-2.0
+
+你建仓库时选了 Apache 2.0，所以本地已统一为 Apache-2.0，三处一致：
+
+| 位置 | 值 |
+| --- | --- |
+| `LICENSE` | 完整 Apache License 2.0 全文（与仓库里那份逐字一致） |
+| `package.json` | `"license": "Apache-2.0"` |
+| `README.md` | `Apache-2.0` |
+
+> 注意：npm 上已发布的 0.1.0 里写的是 **MIT**（发布时的旧值）。0.1.1 会带上正确的 `Apache-2.0`。
 
 ### 2c. 给仓库加 `dsh-plugin` topic（收录要求）
 
@@ -361,22 +374,19 @@ npm view dsh-model-relay repository.url author version
 ## 一页速查
 
 ```sh
-# ---- 第 1 步：发 npm ----
+# ---- 第 1 步：重发 npm（0.1.1，修元数据）----
 cd /vol2/@apphome/fn-deepseek-harness/profiles/日常/dsh-model-relay
 
 npm login --registry=https://registry.npmjs.org/   # 或配 bypass-2FA 的 granular token
 npm whoami --registry=https://registry.npmjs.org/  # 确认身份
 npm publish --dry-run                              # 必须显示 registry.npmjs.org
 npm publish --otp=123456                           # 若报 E403 就这样补 OTP
-npm view dsh-model-relay version                   # 确认上线
+npm view dsh-model-relay version                   # 应为 0.1.1
 
-# ---- 第 2a 步：建仓库并推代码（今天做）----
-# 先在 GitHub 网页新建公开仓库 qilin-zhu/dsh-model-relay（不要勾 README）
+# ---- 第 2a 步：推代码（今天做）----
+# 仓库已建好、本地已 commit，只需 push：
 cd /vol2/@apphome/fn-deepseek-harness/profiles/日常/dsh-model-relay
-git init && git add -A && git commit -m "feat: 模型中转站"
-git branch -M main
-git remote add origin https://github.com/qilin-zhu/dsh-model-relay.git
-git push -u origin main
+git push origin main
 # 再到仓库页面加 topic: dsh-plugin
 
 # ---- 第 2b 步：提收录 PR（仓库满 1 天后）----
