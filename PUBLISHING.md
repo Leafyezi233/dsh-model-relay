@@ -343,45 +343,66 @@ PR 步骤：
 
 ---
 
-## 已发布的 0.1.0 需要升版重发
+## npm 发布状态：0.1.1 已上线 ✅
 
-**0.1.0 已经在 npm 上**（发布于 2026-09-18），但它的元数据是发布前的旧值：
-
-| 字段 | 线上 0.1.0 | 应为 |
+| 版本 | 状态 | 说明 |
 | --- | --- | --- |
-| `repository` | `git+https://github.com/tnnevol/fn-os-apps.git` | `git+https://github.com/qilin-zhu/dsh-model-relay.git` |
-| `author` | `tnnevol` | `qilin-zhu` |
-| peer 范围 | 精确钉住 `0.1.5-rc.2` | `^0.1.5-rc.2 \|\| ^0.1.6-alpha.1` |
+| `0.1.0` | 已发布 | 元数据是旧值（`repository` 指向 `tnnevol/fn-os-apps`、`author` 是 `tnnevol`、license MIT）。**已被 0.1.1 取代**，不用管它 |
+| `0.1.1` | **已发布，`latest`** | 元数据已修正：`qilin-zhu/dsh-model-relay`、`author: qilin-zhu`、Apache-2.0、peer 范围 `\|\|` 分支 |
 
-**npm 不允许覆盖已发布版本**（会报 `You cannot publish over the previously published versions`），所以本地已把版本升到 **0.1.1**，直接发即可：
+**0.1.0 无法撤回**（npm 不允许删除已发布版本，超过 72 小时更是完全锁死）。它留在版本列表里无害——`latest` 指向 0.1.1，用户 `npm install dsh-model-relay` 拿到的就是 0.1.1。
 
-```sh
-cd /vol2/@apphome/fn-deepseek-harness/profiles/日常/dsh-model-relay
-npm publish --otp=123456      # 若还开着 2FA
-```
-
-**为什么必须重发**：收录规则要求「已发布包的 `repository` 字段必须指回本列表收录的那个仓库，否则两者不会关联」。0.1.0 指向别人的仓库，市场就挂不上下载量、也认不出这是你的包。
-
-重发后确认元数据已修正：
+### E409 是什么意思
 
 ```sh
-npm view dsh-model-relay repository.url author version
-# 应显示 qilin-zhu/dsh-model-relay、qilin-zhu、0.1.1
+npm ERR! code E409
+npm ERR! 409 Conflict - PUT https://registry.npmjs.org/dsh-model-relay
+npm ERR! Cannot publish over previously staged version "0.1.1".
 ```
+
+**这不是失败，是「你已经发过了」。** npm 在你第一次 `publish` 时就把 0.1.1 写进了 registry，第二次同版本再发，服务端拒绝覆盖——`staged` 是 npm 对「该版本已存在于发布流程中」的措辞。
+
+判断方法（别只看 `npm view`）：
+
+```sh
+curl -s https://registry.npmjs.org/dsh-model-relay | grep -o '"latest":"[^"]*"'
+# 或
+curl -s -o /dev/null -w '%{http_code}\n' \
+  https://registry.npmjs.org/dsh-model-relay/0.1.1     # 200 = 已发布
+```
+
+### 为什么 `npm view` 会显示 0.1.0
+
+两个原因叠加，**它显示的版本不可信**：
+
+1. 本机 `.npmrc` 指向**腾讯镜像**，镜像同步官方源有延迟，新版本不会立刻出现。
+2. 以 `root` 跑时 npm 缓存目录（`/root/.npm`）有权限问题，`npm view` 可能直接报错。
+
+要拿准值就显式指定官方源，或用 curl：
+
+```sh
+npm view dsh-model-relay version --registry=https://registry.npmjs.org/
+```
+
+### 想发下一版
+
+```sh
+npm version patch        # 0.1.1 -> 0.1.2
+npm publish --otp=123456
+```
+
+**同一版本号永远不能发两次**，必须升版本号。
 
 ---
 
 ## 一页速查
 
 ```sh
-# ---- 第 1 步：重发 npm（0.1.1，修元数据）----
-cd /vol2/@apphome/fn-deepseek-harness/profiles/日常/dsh-model-relay
-
-npm login --registry=https://registry.npmjs.org/   # 或配 bypass-2FA 的 granular token
-npm whoami --registry=https://registry.npmjs.org/  # 确认身份
-npm publish --dry-run                              # 必须显示 registry.npmjs.org
-npm publish --otp=123456                           # 若报 E403 就这样补 OTP
-npm view dsh-model-relay version                   # 应为 0.1.1
+# ---- 第 1 步：npm ✅ 已完成（0.1.1 是 latest）----
+# 无需再发。确认：
+curl -s https://registry.npmjs.org/dsh-model-relay | grep -o '"latest":"[^"]*"'
+# 下次发新版才需要：
+#   npm version patch && npm publish --otp=123456
 
 # ---- 第 2a 步：推代码（今天做）----
 # 仓库已建好、本地已 commit，只需 push：
@@ -396,14 +417,16 @@ git push origin main
 # 开 PR 到 main，等 CI 绿 + 合并
 ```
 
-## 最可能踩的四个坑
+## 最可能踩的五个坑
 
 | 坑 | 症状 | 处理 |
 | --- | --- | --- |
 | 发到腾讯镜像 | `npm publish` 失败 / 让你登录镜像 | 已用 `publishConfig.registry` 固定；`--dry-run` 自查 |
 | **2FA 拦住发布** | `E403 ... granular access token with bypass 2fa` | `npm publish --otp=123456`，或建带 Bypass 2FA 的 granular token |
+| **重复发布** | `E409 ... Cannot publish over previously staged version` | **不是失败**，是已经发过了。升版本号再发 |
 | 仓库目录没推 | 收录条目 url 是死链，PR 被打回 | 先做 2a，`curl` 确认返回 200 |
 | 只声明 `dsh.client` | 装了不生效 / 被拒 | 本包已同时声明 `dsh.bundle` |
+| 误信 `npm view` | 显示旧版本，以为没发成功 | 它走腾讯镜像 + root 缓存有问题；用 `curl` 或加 `--registry` |
 
 ## 需要我代劳时
 
