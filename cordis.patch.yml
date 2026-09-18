@@ -1,0 +1,43 @@
+# The dsh-model-relay bundle patch.
+#
+# Two considerations shape this file.
+#
+# 1. The gateway mounts an OpenAI-compatible `/v1` route on the existing Web
+#    server and forwards every call through the `llm` service, so it reuses
+#    whatever provider plugins are already registered (for example
+#    @tnnevol/dsh-codebuddy) instead of holding its own provider credentials.
+#
+# 2. The settings page manages API keys over a plugin-owned RPC channel. dsh
+#    0.1.5-rc.2 resolves an RPC channel's owner from the Connection service
+#    context, so the channel only mounts when Connection itself is given the
+#    Web server dependency.
+#
+# The `connection` row below therefore SUPERSEDES the one the codebuddy bundle
+# already patches. Loader patches replace a targeted row's whole `inject` list
+# rather than merging into it, so this list must stay the union of every
+# dependency any registered connection-RPC plugin requires — today that is
+# `webRuntime` and `webServer`. A later bundle adding its own channel has to
+# restate the same union.
+
+- id: connection
+  inject:
+    - webRuntime
+    - webServer
+
+- insert:
+    - id: dsh-model-relay
+      name: 'dsh-model-relay'
+      # No config ships here on purpose. The gateway defaults to loopback only,
+      # which is the safe default for anyone installing this bundle.
+      #
+      # To reach it from other devices on the LAN, opt in from YOUR profile's
+      # own patch layer (profiles/<name>/cordis.patch.yml), which is applied
+      # after every bundle and therefore wins:
+      #
+      #   - id: dsh-model-relay
+      #     inject: [llm, webServer]
+      #     config:
+      #       lanPort: 3081
+      #
+      # Create an API key first: the LAN listener otherwise accepts every
+      # device on the network.

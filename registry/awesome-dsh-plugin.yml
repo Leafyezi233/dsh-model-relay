@@ -1,0 +1,11 @@
+# Submission file for the awesome-dsh-plugin catalog.
+#
+# Open a PR against https://github.com/awesome-dsh-plugin/awesome-dsh-plugin
+# adding this as data/plugins/qilin-zhu__dsh-model-relay.yml
+# The two READMEs are generated from that data and must not be edited by hand.
+url: https://github.com/qilin-zhu/dsh-model-relay
+name: qilin-zhu/dsh-model-relay
+category: model
+description:
+  en: 'Model relay station: serve any registered DSH model over an OpenAI-compatible /v1 API, with API keys, a LAN listener and a settings page.'
+  zh: '模型中转站：把 DSH 里已注册的模型以 OpenAI 兼容的 /v1 接口提供给其他项目，带 API 密钥管理、局域网监听和设置页。'
