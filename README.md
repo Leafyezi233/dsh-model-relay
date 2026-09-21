@@ -12,6 +12,44 @@
 
 由此还顺带复用了上游插件的账号故障转移、额度感知、图片序列化和模型目录。
 
+## DSH 版本支持
+
+| DSH 版本 | 状态 | 说明 |
+| --- | --- | --- |
+| `0.1.5-rc.2` ~ `0.1.6-alpha.2` | ✅ | 上游原本支持的范围 |
+| **`0.1.2-rc.1`** | ✅ | **本 fork 新增**，需要下面三处修复 |
+| `0.1.1` 及更早 | ❌ | 不在声明范围内，且缺少请求级 `system` 字段 |
+
+本仓库的 `package.json` 声明：
+
+```json
+"engines": { "dsh": "0.1.2-rc.1 || ^0.1.5-rc.2 || ^0.1.6-alpha.1" }
+```
+
+六个 `@deepseek-ai/*` peer 依赖同样带上 `0.1.2-rc.1 ||` 分支。
+
+> **为什么写成 `||` 而不是 `>=0.1.2-rc.1 <0.2.0-0`？**
+>
+> 后者看起来更宽，其实是陷阱。semver 规定：**只有范围里某个比较符与目标版本的 `major.minor.patch` 元组完全一致、且自身带预发布标签时，预发布版本才会被放行。** 所以 `>=0.1.2-rc.1 <0.2.0-0` 里的 `<0.2.0-0` 不构成放行条件，而 `>=0.1.2-rc.1` 只对 `0.1.2-*` 生效——结果是 `0.1.5-rc.2` 和 `0.1.6-rc.1` **全被排除**，用户会撞上 `ERESOLVE`。三段式 `||` 才是正确的。
+
+三种写法的实际匹配结果：
+
+| 写法 | 0.1.2-rc.1 | 0.1.5-rc.2 | 0.1.6-rc.1 |
+| --- | --- | --- | --- |
+| `>=0.1.5-rc.2 <0.2.0-0`（上游原写法） | ❌ | ✅ | ❌ |
+| `>=0.1.2-rc.1 <0.2.0-0`（看着更宽） | ✅ | ❌ | ❌ |
+| `0.1.2-rc.1 \|\| ^0.1.5-rc.2 \|\| ^0.1.6-alpha.1` | ✅ | ✅ | ✅ |
+
+### 0.1.2-rc.1 上必须的三处修复
+
+上游 0.1.1 的代码在 `0.1.2-rc.1` 上**装得上但跑不起来**，本 fork 修的正是这三处：
+
+1. **系统提示词**：`0.1.2-rc.1` 的 `@deepseek-ai/dsh-llm` 不再导出 `createSystemMessage`，`MessageSourceMap` 里也没有 `system`。原代码的顶层命名导入会直接抛 `SyntaxError`，插件**完全加载不了**。正确形状是请求级的 `options.system`（`GenerateOptions.system`），适配器会把它映射到 provider 自己的 system slot。
+2. **`Tag` 组件**：`dsh-client-ui-primitives` 在 `0.1.2-rc.1` 里不导出 `Tag`，`primitives.Tag` 是 `undefined`，渲染设置页时抛错、整个区块挂不上。改用实际存在的 `Pill`（注意它接的是 `active`，不是 `tone`）。
+3. **`connection` patch**：见上文「配置」里的说明，已删除。
+
+`compatibility.json` 里的 `dshPluginApi.version` 也改了，但那是**惰性元数据**——DSH 运行时不读这个字段，真正起作用的是 `package.json` 的 `engines.dsh` 和 peer 范围。
+
 ## 安装
 
 发布到 npm 后，最简单的方式是在 DSH 里打开 **设置 → 插件市场** 搜索「模型中转站」一键安装。
@@ -32,7 +70,7 @@ dsh plugin --profile web add /绝对路径/dsh-model-relay
 http://127.0.0.1:3080/v1
 ```
 
-> 本插件尚未发布到 npm 与插件目录。发布步骤见 [PUBLISHING.md](PUBLISHING.md)。
+> npm 上的 `dsh-model-relay` 只到 0.1.1，且**与本仓库当前代码不同步**：0.1.1 用的是旧版 DSH 插件 API，在 0.1.2-rc.1 上会直接崩（详见下文「DSH 版本支持」）。这个 fork 的修复只在仓库里，没有发布到 npm。
 
 ## 用法
 
@@ -219,7 +257,13 @@ http://<这台机器的局域网IP>:3081/v1
     lanHost: 0.0.0.0
 ```
 
-> 本插件的 bundle patch 会复写 `connection` 那一行的 `inject`（loader patch 是整值替换，不合并）。它必须保持为所有需要 connection RPC 的插件所要求依赖的并集——目前是 `webRuntime` 和 `webServer`。以后再有插件加自己的 RPC 通道，也要一起维护这个并集。
+> **本插件不 patch `connection` 那一行。**
+>
+> 早期版本曾用 bundle patch 复写 `connection` 的 `inject`，想把它补成 `webRuntime` + `webServer`。这个做法是错的：loader patch 是**整值替换**（`dsh-app-boot` 的 `applyEntryPatches` 做的是 `target[key] = value`），不合并，所以它不是"补充"而是"覆盖掉别人写的所有内容"。
+>
+> 在真实组合里那一行还带着其他层的要求：`dsh-webgate` 会加上 `lanAccessHosts` 和从 `ctx.lanAccessHosts` 读的 `trustedHosts`；`connection` 自己声明 `inject: ["webServer", "credentials"]` 并直接读 `ctx.credentials` 构造 BrowserAuth。覆盖它会同时丢掉 `lanAccessHosts` 和 `credentials`，导致 Connection 起不来——**整个 `/api` 通道连同 Web 界面一起挂掉**，不只是本插件的设置页。
+>
+> 结论：`connection` 由 bundle 栈组合，插件只消费它的服务，不去定义它的依赖。需要 connection RPC 的插件各自声明 `inject` 即可，不需要（也不应该）由本插件代为维护那个并集。
 
 ## 边界
 
