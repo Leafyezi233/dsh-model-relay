@@ -25,7 +25,11 @@
 
 - insert:
     - id: dsh-model-relay
-      name: 'dsh-model-relay'
+      # The `id` above stays unscoped on purpose: it is the anchor your own
+      # profile patch layer targets (`- id: dsh-model-relay`), so scoping it
+      # would silently break every existing override. Only `name` — the
+      # resolvable package identity — carries the npm scope.
+      name: '@leaf233/dsh-model-relay'
       # No config ships here on purpose. The gateway defaults to loopback only,
       # which is the safe default for anyone installing this bundle.
       #

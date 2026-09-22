@@ -1,4 +1,6 @@
-# 模型中转站 (dsh-model-relay)
+# 模型中转站 (@leaf233/dsh-model-relay)
+
+> 本仓库是 [qilin-zhu/dsh-model-relay](https://github.com/qilin-zhu/dsh-model-relay) 的 fork，包名 `@leaf233/dsh-model-relay`。上游 npm 包 `dsh-model-relay`（0.1.1）与本 fork 无关、也不兼容 `0.1.2-rc.1`，见下文「安装」。
 
 给 DeepSeek Harness 挂一个 OpenAI 兼容的 `/v1` 接口，把 harness 里已注册的大模型（比如 `@tnnevol/dsh-codebuddy` 里的 CodeBuddy 模型）反代出去，其他项目用标准 OpenAI 客户端就能调用。
 
@@ -58,10 +60,10 @@
 
 ```sh
 # 从 npm 安装（发布后）
-dsh plugin --profile web add dsh-model-relay
+dsh plugin --profile web add @leaf233/dsh-model-relay
 
 # 本地开发（file: 链接）
-dsh plugin --profile web add /绝对路径/dsh-model-relay
+dsh plugin --profile web add /绝对路径/relay-upstream
 ```
 
 装完重启 Web profile，服务地址是：
@@ -70,7 +72,21 @@ dsh plugin --profile web add /绝对路径/dsh-model-relay
 http://127.0.0.1:3080/v1
 ```
 
-> npm 上的 `dsh-model-relay` 只到 0.1.1，且**与本仓库当前代码不同步**：0.1.1 用的是旧版 DSH 插件 API，在 0.1.2-rc.1 上会直接崩（详见下文「DSH 版本支持」）。这个 fork 的修复只在仓库里，没有发布到 npm。
+> **这个 fork 用 `@leaf233` 作用域名，不是上游的 `dsh-model-relay`。**
+>
+> npm 上那个**不带 scope 的 `dsh-model-relay` 属于上游作者**（maintainer `jarvistop`，仓库 `qilin-zhu/dsh-model-relay`），本 fork 无权发布它，而且它只到 **0.1.1**、与本仓库代码不同步：0.1.1 用的是旧版 DSH 插件 API，在 `0.1.2-rc.1` 上会直接崩（详见下文「DSH 版本支持」）。
+>
+> 所以认准 **`@leaf233/dsh-model-relay`**（本 fork，`0.2.0`）。`@leaf233` 下已有本仓库作者的另一个插件 `@leaf233/dsh-llm-rate-limiter`。
+>
+> **注意区分三个名字**，它们故意不一样：
+>
+> | 名字 | 值 | 用途 |
+> |---|---|---|
+> | 包名 | `@leaf233/dsh-model-relay` | npm 安装、`bundles` 列表 |
+> | patch 行的 `id` | `dsh-model-relay` | 你在自己 profile 里覆盖配置时的锚点 |
+> | provider id | `dsh-model-relay` | DSH 模型选择器里的分组命名空间（`<provider>_<模型>`） |
+>
+> 只有**包名**带 scope。`id` 和 provider id 保持不带 scope，所以已有的配置覆盖和分组名不受影响。
 
 ## 用法
 
@@ -293,10 +309,10 @@ node test/keys.test.mjs      # 密钥存储：哈希、权限、并发、锁定�
 > 所以改完源码后如果行为没变，别怀疑代码——先对一下内容：
 >
 > ```sh
-> diff -r lib/ /绝对路径/profiles/web/node_modules/dsh-model-relay/lib/
+> diff -r lib/ /绝对路径/profiles/web/node_modules/@leaf233/dsh-model-relay/lib/
 > ```
 >
-> 不一致就重新执行 `dsh plugin --profile web add file:/绝对路径/dsh-model-relay`。注意 pnpm 可能报 "Already up to date" 而不重新链接，这种情况先 `remove` 再 `add`。
+> 不一致就重新执行 `dsh plugin --profile web add file:/绝对路径/relay-upstream`。注意 pnpm 可能报 "Already up to date" 而不重新链接，这种情况先 `remove` 再 `add`。
 >
 > 想让改动彻底自动生效，可以把依赖换成 `link:`。
 
