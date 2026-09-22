@@ -30,6 +30,7 @@ const SUITES = [
   'registration.test.mjs',
   'failure-code.test.mjs',
   'verify-table.mjs',
+  'client-id.test.mjs',
 ]
 
 const tally = (output, marker) => (output.match(new RegExp(`^${marker}`, 'gm')) ?? []).length
