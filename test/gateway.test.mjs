@@ -23,17 +23,27 @@ const keyDir = mkdtempSync(join(tmpdir(), 'dsh-gw-test-'))
 let keySeq = 0
 const nextKeysFile = () => join(keyDir, `keys-${keySeq++}.json`)
 
-/** Apply the plugin with an isolated key store unless the case overrides one. */
+/** A group store location unique to this test case. */
+const nextGroupsFile = () => join(keyDir, `groups-${keySeq++}.json`)
+
+/**
+ * Apply the plugin with isolated stores unless the case overrides them.
+ *
+ * Both stores must be isolated for the same reason: the gateway reads them per
+ * request, so an ambient file would make these assertions depend on the machine
+ * and on whatever the developer last configured.
+ */
 function mount(ctx, config = {}) {
-  const { keysFile = nextKeysFile(), ...rest } = config
-  apply(ctx, { keysFile, ...rest })
+  const { keysFile = nextKeysFile(), groupsFile = nextGroupsFile(), ...rest } = config
+  apply(ctx, { keysFile, groupsFile, ...rest })
 }
 
 /** Build a fake Cordis context with a scripted llm service. */
-function makeCtx(chunks, { onStream } = {}) {
+function makeCtx(chunks, { onStream, streamFor, modelInfo, efforts } = {}) {
   const routes = []
   const infos = []
   const warnings = []
+  const streamCalls = []
   /** Disposers returned by ctx.effect, so tests can release LAN listeners. */
   const disposers = []
   /** Settings Fetch routes registered by the plugin, keyed by path. */
@@ -73,15 +83,52 @@ function makeCtx(chunks, { onStream } = {}) {
       },
     },
     llm: {
+      /**
+       * The plugin registers itself as a provider, so the fake service reports
+       * that route too. Leaving it out would hide the self-reference case and
+       * make the gateway look like it cannot collide with its own names.
+       *
+       * It advertises no models of its own: in the real composition the
+       * registration exists to carry the group list, and the underlying
+       * provider models this service reports are what a group is built from.
+       */
       listProviders: () => [
         { id: 'codebuddy', name: 'CodeBuddy' },
         { id: 'deepseek', name: 'DeepSeek' },
+        { id: 'dsh-model-relay', name: 'dsh-model-relay' },
       ],
-      listModels: async (provider) => (provider === 'codebuddy'
-        ? [{ provider, id: 'deepseek-v4.1-flash', name: 'Flash' }, { provider, id: 'glm-5.2', name: 'GLM' }]
-        : [{ provider, id: 'deepseek-chat', name: 'Chat' }]),
+      listModels: async (provider) => {
+        if (provider === 'codebuddy') {
+          return [{ provider, id: 'deepseek-v4.1-flash', name: 'Flash' }, { provider, id: 'glm-5.2', name: 'GLM' }]
+        }
+        if (provider === 'dsh-model-relay') return []
+        return [{ provider, id: 'deepseek-chat', name: 'Chat' }]
+      },
+      /**
+       * Capability lookup for one provider model.
+       *
+       * The gateway reads this to intersect a group's members, so the fake has
+       * to answer it. `efforts` scripts the answer; `modelInfo` overrides the
+       * whole object for a case that needs a different shape. The default is
+       * "this member accepts no reasoning choice", which is what makes a group
+       * advertise none.
+       */
+      resolveModelInfo: async (provider, model) => {
+        if (modelInfo !== undefined) return modelInfo(provider, model)
+        return {
+          provider,
+          id: model,
+          context: { contextWindow: 128000 },
+          ...(efforts === undefined ? {} : { reasoning: { efforts: efforts(provider, model) } }),
+        }
+      },
       stream: (options) => {
+        streamCalls.push(options)
         onStream?.(options)
+        // `streamFor` lets a case script per-target behaviour, e.g. make the
+        // first group candidate fail before producing a chunk.
+        const scripted = streamFor?.(options)
+        if (scripted !== undefined) return scripted
         return (async function* generate() {
           for (const chunk of chunks) {
             if (typeof chunk === 'function') yield chunk(options)
@@ -91,7 +138,7 @@ function makeCtx(chunks, { onStream } = {}) {
       },
     },
   }
-  return { ctx, routes, infos, warnings, settingsRoutes, disposers }
+  return { ctx, routes, infos, warnings, settingsRoutes, disposers, streamCalls }
 }
 
 /** Start a server around the registered prefix route and return helpers. */
@@ -444,11 +491,17 @@ await test('a bare id shared by two providers is refused with the namespaced opt
 await test('the namespaced id selects the intended provider for a shared model id', async () => {
   let seen
   const { ctx, routes } = makeCtx(textChunks, { onStream: (options) => { seen = options } })
-  ctx.llm.listModels = async (provider) => [{ provider, id: 'deepseek-v4-flash', name: 'Flash' }]
+  ctx.llm.listModels = async (provider) => (
+    provider === 'dsh-model-relay'
+      ? []
+      : [{ provider, id: 'deepseek-v4-flash', name: 'Flash' }]
+  )
   mount(ctx, {})
   await withServer(routes, async (base) => {
     const listed = await (await fetch(`${base}/v1/models`)).json()
     // Both providers are listed, each under its own namespace, with no duplicates.
+    // The gateway's own route advertises no models of its own: it exists to
+    // carry the group list, and a group is listed under its plain name.
     const ids = listed.data.map((entry) => entry.id).sort()
     assert.deepEqual(ids, ['codebuddy_deepseek-v4-flash', 'deepseek_deepseek-v4-flash'])
     assert.equal(new Set(ids).size, ids.length, 'namespacing removes the collision')
@@ -878,6 +931,690 @@ await test('the LAN listener still binds when no real interface is detectable', 
     for (const dispose of disposers) dispose()
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
+})
+
+// ---------------------------------------------------------------------------
+// Model groups
+// ---------------------------------------------------------------------------
+
+/** Create a group through the settings endpoint. */
+async function createGroup(settingsRoutes, name, models) {
+  return callSettings(settingsRoutes, 'createGroup', { name, models })
+}
+
+await test('a group name routes to its first candidate', async () => {
+  const { ctx, routes, settingsRoutes, streamCalls } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    const created = await createGroup(settingsRoutes, 'fast-chat', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    assert.equal(created.ok, true, created.error?.message)
+
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'fast-chat', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    // The response echoes what the caller asked for, not the member that served it.
+    assert.equal(body.model, 'fast-chat')
+    // The head candidate is the one actually dispatched.
+    assert.equal(streamCalls.at(-1).provider, 'codebuddy')
+    assert.equal(streamCalls.at(-1).model, 'glm-5.2')
+  })
+})
+
+await test('a group fails over to the next candidate when the first produces no chunk', async () => {
+  const chunks = textChunks
+  const { ctx, routes, settingsRoutes, warnings } = makeCtx(chunks, {
+    streamFor: (options) => {
+      // The first candidate fails before yielding anything, which is exactly
+      // the case that must stay invisible to the client.
+      if (options.provider === 'codebuddy') {
+        return (async function* failing() {
+          throw Object.assign(new Error('credential unavailable'), { code: 'MISSING_CREDENTIAL' })
+        })()
+      }
+      return undefined
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200, 'the second candidate must serve the request')
+    assert.equal((await res.json()).model, 'g')
+    assert.equal(res.headers.get('x-relay-group'), 'g')
+    assert.equal(res.headers.get('x-relay-model'), 'deepseek_deepseek-chat')
+    assert.equal(warnings.some((line) => typeof line === 'string' && line.includes('trying the next')), true)
+  })
+})
+
+await test('a group whose every candidate fails reports the upstream error', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: () => (async function* failing() {
+      throw Object.assign(new Error('nope'), { code: 'MISSING_CREDENTIAL', status: 502 })
+    })(),
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.notEqual(res.status, 200)
+    assert.equal((await res.json()).error.code, 'MISSING_CREDENTIAL')
+  })
+})
+
+await test('an abandoned candidate iterator is closed, not leaked', async () => {
+  let closed = 0
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next: async () => { throw new Error('unavailable') },
+            return: async () => { closed += 1; return { done: true } },
+          }
+        },
+      }
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal(closed, 1, 'the failed attempt must be closed before moving on')
+  })
+})
+
+/**
+ * The failure shape a real provider produces.
+ *
+ * `dsh-llm` does not let an adapter failure escape as a throw: `adapterStream`
+ * catches it at its own boundary and yields a terminal `finish` chunk carrying
+ * `reason.kind === 'error'` (dsh-llm:1692-1710, `adapterFailureChunk`). A fake
+ * that only ever *throws* cannot exercise that, which is why the real failover
+ * path was dead while every mock-based test passed.
+ */
+const failureChunk = (code, message, providerRetryAfterMs) => ({
+  type: 'finish',
+  reason: {
+    kind: 'error',
+    failure: {
+      code,
+      message,
+      ...(providerRetryAfterMs === undefined ? {} : { providerRetryAfterMs }),
+    },
+  },
+})
+
+/**
+ * A caller-supplied `reasoning_effort` that the target member cannot accept.
+ *
+ * DSH itself rejects such a request with UNSUPPORTED_REASONING_EFFORT, which
+ * would turn a stale preference into a hard failure — a session can easily hold
+ * an effort chosen before the group's members changed. Dropping it and warning
+ * is the agreed behaviour, so both halves are asserted here.
+ */
+await test('an unsupported reasoning_effort is dropped with a warning, not rejected', async () => {
+  const { ctx, routes, settingsRoutes, warnings, streamCalls } = makeCtx(textChunks, {
+    // Every member accepts only `low`.
+    efforts: () => [{ id: 'low', name: 'Low' }],
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'g',
+        messages: [{ role: 'user', content: 'hi' }],
+        reasoning_effort: 'max',
+      }),
+    })
+    assert.equal(res.status, 200, 'the request still succeeds')
+    assert.equal(streamCalls.at(-1).reasoningEffort, undefined, 'the unsupported effort was not forwarded')
+    assert.equal(
+      warnings.some((line) => typeof line === 'string' && line.includes('does not accept reasoning effort')),
+      true,
+      'the drop is reported rather than silent',
+    )
+  })
+})
+
+await test('a supported reasoning_effort is forwarded untouched', async () => {
+  const { ctx, routes, settingsRoutes, warnings, streamCalls } = makeCtx(textChunks, {
+    efforts: () => [{ id: 'low', name: 'Low' }, { id: 'max', name: 'Max' }],
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'g',
+        messages: [{ role: 'user', content: 'hi' }],
+        reasoning_effort: 'max',
+      }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal(streamCalls.at(-1).reasoningEffort, 'max')
+    assert.equal(
+      warnings.some((line) => typeof line === 'string' && line.includes('does not accept reasoning effort')),
+      false,
+      'nothing was dropped, so nothing is warned about',
+    )
+  })
+})
+
+await test('a member that declares no reasoning has the parameter dropped', async () => {
+  const { ctx, routes, settingsRoutes, streamCalls } = makeCtx(textChunks, {
+    // `efforts` omitted: the fake declares no reasoning block at all, which is
+    // the shape that produced the reported UNSUPPORTED_REASONING_EFFORT error.
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'g',
+        messages: [{ role: 'user', content: 'hi' }],
+        reasoning_effort: 'high',
+      }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal(streamCalls.at(-1).reasoningEffort, undefined)
+  })
+})
+
+await test('a caller that names no effort sends none', async () => {
+  const { ctx, routes, settingsRoutes, streamCalls } = makeCtx(textChunks, {
+    efforts: () => [{ id: 'low', name: 'Low' }],
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    // Nothing is invented on the caller's behalf.
+    assert.equal(streamCalls.at(-1).reasoningEffort, undefined)
+  })
+})
+
+await test('a direct model call keeps the effort the caller chose, unsupported or not', async () => {
+  const { ctx, routes, streamCalls } = makeCtx(textChunks, {
+    efforts: () => [{ id: 'low', name: 'Low' }],
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    // No group: the caller named both the model and the effort, so silently
+    // discarding its instruction would be worse than letting the provider
+    // reject it with a clear reason.
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'codebuddy_glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        reasoning_effort: 'max',
+      }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal(streamCalls.at(-1).reasoningEffort, 'max', 'the caller\'s explicit choice is forwarded')
+  })
+})
+
+await test('a group fails over when a candidate fails via an error chunk, not a throw', async () => {
+  const { ctx, routes, settingsRoutes, warnings } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      // Yields, does not throw — exactly what `dsh-llm` produces.
+      return (async function* failing() {
+        yield failureChunk('MISSING_CREDENTIAL', 'credential unavailable')
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200, 'the second candidate must serve the request')
+    assert.equal(res.headers.get('x-relay-model'), 'deepseek_deepseek-chat')
+    assert.equal((await res.json()).model, 'g')
+    assert.equal(warnings.some((line) => typeof line === 'string' && line.includes('trying the next')), true)
+  })
+})
+
+await test('an error chunk from every candidate reports the upstream error, not success', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: () => (async function* failing() {
+      yield failureChunk('MISSING_CREDENTIAL', 'nope')
+    })(),
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    // Treating the chunk as an answer would make this a 200 with no content.
+    assert.notEqual(res.status, 200)
+    assert.equal((await res.json()).error.code, 'MISSING_CREDENTIAL')
+  })
+})
+
+await test('a candidate that fails after emitting output is committed, not replaced', async () => {
+  const { ctx, routes, settingsRoutes, streamCalls } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* halfThenFail() {
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text: 'partial' }
+        yield failureChunk('UPSTREAM_ERROR', 'died mid-stream')
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    // The invariant: output was produced, so switching members would replay it.
+    assert.equal(streamCalls.length, 1, 'no second candidate may be tried')
+    // This is a buffered (non-streaming) call, so nothing has been written to
+    // the client yet and the genuine failure is reported as an HTTP error
+    // rather than a 200 carrying half an answer.
+    assert.equal(res.status, 502)
+    assert.equal((await res.json()).error.code, 'UPSTREAM_ERROR')
+  })
+})
+
+await test('a committed failure mid-stream is reported, not retried', async () => {
+  const { ctx, routes, settingsRoutes, streamCalls } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* halfThenFail() {
+        yield { type: 'text-delta', index: 0, text: 'partial' }
+        yield failureChunk('UPSTREAM_ERROR', 'died mid-stream')
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+    })
+    const text = await res.text()
+    assert.equal(streamCalls.length, 1, 'no second candidate may be tried')
+    assert.equal(res.status, 200, 'headers were already committed by the first delta')
+    assert.equal(text.includes('partial'), true, 'the delivered content is not replayed')
+    assert.equal(text.includes('UPSTREAM_ERROR'), true, 'the failure is still surfaced')
+  })
+})
+
+await test('usage alone does not commit an attempt', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      // Usage carries no model output, so the caller has still seen nothing.
+      return (async function* usageThenFail() {
+        yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 } }
+        yield failureChunk('RATE_LIMIT', 'slow down')
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('x-relay-model'), 'deepseek_deepseek-chat')
+  })
+})
+
+await test('an aborted candidate is never failed over', async () => {
+  const { ctx, routes, settingsRoutes, streamCalls } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      // A cancellation is the caller giving up, not a candidate failing.
+      return (async function* aborted() {
+        yield { type: 'finish', reason: { kind: 'aborted' } }
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    // Restarting work the caller just cancelled would be a correctness bug.
+    assert.equal(streamCalls.length, 1, 'an abort must not start another candidate')
+  })
+})
+
+await test('a disabled group is not routable', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    assert.equal((await callSettings(settingsRoutes, 'updateGroup', { id: 'g', enabled: false })).ok, true)
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    // Falls through to ordinary model resolution, which cannot find "g".
+    assert.notEqual(res.status, 200)
+  })
+})
+
+await test('a group naming this gateway is refused rather than recursing', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    // The gateway registers itself as a provider, so this spelling looks
+    // legitimate; resolving it must stop instead of looping back into itself.
+    const created = await createGroup(settingsRoutes, 'self', ['dsh-model-relay_self'])
+    assert.equal(created.ok, true, 'the store accepts it; resolution is where it is refused')
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'self', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.notEqual(res.status, 200)
+    assert.equal((await res.json()).error.code, 'group_self_reference')
+  })
+})
+
+await test('groups are visible in the model catalog alongside real models', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'fast-chat', ['codebuddy_glm-5.2'])
+    const body = await (await fetch(`${base}/v1/models`)).json()
+    const ids = body.data.map((entry) => entry.id)
+    assert.equal(ids.includes('fast-chat'), true, 'an external caller must see the group')
+    assert.equal(ids.includes('codebuddy_glm-5.2'), true, 'and the underlying models too')
+  })
+})
+
+await test('the settings channel lists, updates, and removes groups', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async () => {
+    assert.equal((await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])).ok, true)
+    assert.equal((await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])).ok, false, 'duplicate refused')
+
+    const listed = await callSettings(settingsRoutes, 'listGroups')
+    assert.equal(listed.ok, true)
+    assert.deepEqual(listed.value.groups.map((group) => group.name), ['g'])
+
+    assert.equal((await callSettings(settingsRoutes, 'updateGroup', { id: 'g', models: ['deepseek_deepseek-chat'] })).ok, true)
+    assert.deepEqual((await callSettings(settingsRoutes, 'listGroups')).value.groups[0].models, ['deepseek_deepseek-chat'])
+
+    assert.equal((await callSettings(settingsRoutes, 'removeGroup', { id: 'g' })).ok, true)
+    assert.deepEqual((await callSettings(settingsRoutes, 'listGroups')).value.groups, [])
+  })
+})
+
+await test('group names colliding with a model name are rejected by the store', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async () => {
+    // An underscore would make the name indistinguishable from `<provider>_<model>`.
+    const bad = await createGroup(settingsRoutes, 'codebuddy_glm-5.2', ['codebuddy_glm-5.2'])
+    assert.equal(bad.ok, false)
+    assert.equal(bad.error.code, 'INVALID_GROUP')
+    assert.match(bad.error.message, /下划线/)
+  })
+})
+
+/**
+ * An upstream `Retry-After` must survive to the HTTP client.
+ *
+ * `dsh-llm-deepseek` parses the header into `providerRetryAfterMs`, and
+ * `dsh-llm-retry` prefers it over its own backoff. Dropping it makes the
+ * gateway hammer a provider that explicitly asked for quiet.
+ */
+await test('an upstream retry hint becomes a Retry-After header', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* rateLimited() {
+        // 30s in ms, exactly as a provider adapter would report it.
+        yield failureChunk('RATE_LIMIT', 'slow down', 30000)
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 429)
+    assert.equal(res.headers.get('retry-after'), '30')
+  })
+})
+
+await test('a sub-second retry hint rounds up to one second, never to zero', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* brief() {
+        yield failureChunk('RATE_LIMIT', 'slow down', 250)
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    // Rounding down to 0 would mean "retry immediately", defeating the hint.
+    assert.equal(res.headers.get('retry-after'), '1')
+  })
+})
+
+await test('no retry hint means no Retry-After header', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* noHint() {
+        yield failureChunk('RATE_LIMIT', 'slow down')
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 429)
+    assert.equal(res.headers.get('retry-after'), null)
+  })
+})
+
+await test('the retry hint reaches the failing group member, not just the first', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      // The FIRST candidate fails without a hint; the second supplies one. The
+      // hint must come from the candidate that actually ended the call.
+      if (options.provider === 'codebuddy') {
+        return (async function* first() {
+          yield failureChunk('RATE_LIMIT', 'first leg busy')
+        })()
+      }
+      return (async function* second() {
+        yield failureChunk('RATE_LIMIT', 'second leg busy', 12000)
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 429)
+    assert.equal(res.headers.get('retry-after'), '12')
+  })
+})
+
+await test('the internal retry hint never leaks into the SSE error payload', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* diesAfterOutput() {
+        yield { type: 'text-delta', index: 0, text: 'partial' }
+        yield failureChunk('RATE_LIMIT', 'slow down', 30000)
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+    })
+    const body = await res.text()
+    // `providerRetryAfterMs` is our internal name; OpenAI clients must not see it.
+    assert.equal(body.includes('providerRetryAfterMs'), false)
+    assert.equal(body.includes('slow down'), true, 'the failure itself is still reported')
+  })
+})
+
+/**
+ * A wrong credential must not be reported as a gateway fault.
+ *
+ * `dsh-llm-deepseek` reports `AUTH` for HTTP 401 AND 403
+ * (dsh-llm-deepseek:1513). Answering 502 would tell the caller the gateway
+ * broke, when the truth is that the credential is wrong — and a caller acts on
+ * those two differently.
+ */
+await test('an AUTH failure answers 401, not a generic 502', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* unauthorized() {
+        yield failureChunk('AUTH', 'invalid api key')
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 401)
+  })
+})
+
+/**
+ * A provider that reports its own HTTP status must be believed.
+ *
+ * `dsh-llm-deepseek` attaches `status: response.status` to every HTTP failure,
+ * which is finer-grained than the code: `AUTH` covers 401 and 403 alike, and a
+ * provider-specific status such as 402 has no code mapping at all.
+ */
+await test("the provider's own HTTP status wins over the code's family", async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* forbidden() {
+        // Code says AUTH (401 family); the provider actually said 403.
+        yield { type: 'finish', reason: { kind: 'error', failure: { code: 'AUTH', message: 'forbidden', status: 403 } } }
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 403)
+  })
+})
+
+await test('a rejection of the request itself answers 400, not 502', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* badEffort() {
+        yield failureChunk('UNSUPPORTED_REASONING_EFFORT', 'no such effort')
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    // The caller asked for something the target cannot do; that is their bug to
+    // fix, not an upstream outage.
+    assert.equal(res.status, 400)
+  })
 })
 
 console.log(failures === 0 ? '\nAll gateway translation tests passed.' : `\n${failures} test(s) failed.`)

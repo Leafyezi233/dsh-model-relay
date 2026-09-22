@@ -31,6 +31,8 @@ export interface GatewayConfig {
   cors?: boolean
   /** Key store path. @default '<DSH_HOME>/model-relay-keys.json' */
   keysFile?: string
+  /** Model-group store path. @default '<DSH_HOME>/model-relay-groups.json' */
+  groupsFile?: string
   /**
    * Optional second listener bound to the LAN, serving only the model API.
    * `false` disables it; `0` asks the OS for a free port.
@@ -41,10 +43,19 @@ export interface GatewayConfig {
   lanHost?: string
 }
 
-/** Resolved configuration with every default applied. */
-export interface ResolvedGatewayConfig extends Required<Omit<GatewayConfig, 'defaultProvider' | 'keysFile'>> {
+/**
+ * Resolved configuration with every default applied.
+ *
+ * `defaultProvider`, `keysFile`, and `groupsFile` are omitted from `Required`
+ * and re-declared as optional, because each has a runtime default that is
+ * resolved lazily: an absent `keysFile` or `groupsFile` is filled in from the
+ * DSH home directory, and an absent `defaultProvider` stays absent. Marking
+ * them required would describe them as always present.
+ */
+export interface ResolvedGatewayConfig extends Required<Omit<GatewayConfig, 'defaultProvider' | 'keysFile' | 'groupsFile'>> {
   defaultProvider: string | undefined
   keysFile: string | undefined
+  groupsFile: string | undefined
 }
 
 /**

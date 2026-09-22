@@ -30,6 +30,8 @@
 
 六个 `@deepseek-ai/*` peer 依赖同样带上 `0.1.2-rc.1 ||` 分支。
 
+> **模型分组还需要 `@deepseek-ai/schemastery`。** 分组要出现在 **设置 → 模型** 里，就必须同时注册一个 settings section（见下文"模型分组"），而 `installSection` 需要一个 schema。这是唯一一个非 `dsh-*` 的 peer 依赖；它由 DSH 自带，正常情况下不需要单独安装。
+
 > **为什么写成 `||` 而不是 `>=0.1.2-rc.1 <0.2.0-0`？**
 >
 > 后者看起来更宽，其实是陷阱。semver 规定：**只有范围里某个比较符与目标版本的 `major.minor.patch` 元组完全一致、且自身带预发布标签时，预发布版本才会被放行。** 所以 `>=0.1.2-rc.1 <0.2.0-0` 里的 `<0.2.0-0` 不构成放行条件，而 `>=0.1.2-rc.1` 只对 `0.1.2-*` 生效——结果是 `0.1.5-rc.2` 和 `0.1.6-rc.1` **全被排除**，用户会撞上 `ERESOLVE`。三段式 `||` 才是正确的。
@@ -118,12 +120,152 @@ curl http://127.0.0.1:3080/v1/chat/completions \
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/v1/models` | 列出所有已注册 provider 的模型 |
+| `GET` | `/v1/models` | 列出所有已注册 provider 的模型，以及你的模型分组 |
 | `POST` | `/v1/chat/completions` | 对话，支持 `stream: true` |
 
 请求体与 OpenAI Chat Completions 一致：`model`、`messages`、`stream`、`tools`、`tool_choice`、`temperature`、`max_tokens`、`stop`、`reasoning_effort`。支持 `role: "tool"` 的工具结果回传、assistant 的 `tool_calls` 回放、以及 `image_url` 图片输入（data URL 或远程 URL）。
 
 流式响应是标准 SSE，以 `data: [DONE]` 结束。
+
+## 模型分组
+
+**分组 = 一组模型的有序候选列表。** 给这组模型起个名字，之后用这个名字调用，网关按顺序逐个尝试，**第一个能应答的就被采用**。
+
+这是"额度轮换"最直接的用法：把同一个模型在不同供应商上的实例排成一组，一个用不了了自动落到下一个。
+
+```python
+# 直接调用分组名
+resp = client.chat.completions.create(
+    model="fast-chat",
+    messages=[{"role": "user", "content": "你好"}],
+)
+```
+
+在 **设置 → 模型中转站 → 模型分组** 里创建和管理，用 ↑ ↓ 调候选顺序。
+
+### 在 DSH 本体里也能用
+
+本插件会**把自己注册成一个名为 `dsh-model-relay` 的 DSH provider**，它的"模型目录"就是你的分组列表。打开 **设置 → 模型**，在 `dsh-model-relay` 下面就能像选普通模型一样选到分组名。
+
+分组名同样出现在 `/v1/models` 里，所以外部客户端和 DSH 两边都能用。
+
+> DSH 的模型选择器是全局的——注册之后，**所有**会话都能选到这些分组。
+>
+> 底层模型仍然可以直接调用（`codebuddy_deepseek-v4-flash` 这种全名照常可用）。想让外部**只**看到分组，把 `providers` 配成 `[dsh-model-relay]` 即可——但那是**对外**的过滤，不影响 DSH 界面里能看到什么。
+
+### 回退只在"还没有任何输出"之前发生
+
+唯一需要理解的行为约束：
+
+- 上游**还没吐出任何内容**就失败（连不上、凭证失效、上游报错）→ **自动换下一个候选**，客户端完全察觉不到。
+- 上游**已经吐出内容**之后再断 → **不换**，流被截断。
+
+第二条不是偷懒：已经吐出去的内容客户端已经收到了，此时换腿会造成重复输出。所以分组能兜住"这个供应商现在用不了"，但兜不住"响应写到一半断了"。
+
+"吐出内容"的判定见上面的排查小节——只有 `usage` 分片不算。
+
+### 候选全挂了之后：失败码必须活着走出边界
+
+所有候选都失败时，网关抛出一个 `GatewayError`。这个异常要穿过 `dsh-llm` 的适配器边界，而边界上的 `normalizeLlmFailure` **只认 `HarnessError` 的 `code`**；其它 Error 一律被压成 `UNKNOWN`。
+
+这件事要命的地方在于：`dsh-base` 里挂着 `dsh-llm-retry`，它的重试判据是
+
+```js
+policy.retryableCodes.includes(failure.code)
+```
+
+默认集合是 `EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` / `TIMEOUT` / `TRANSPORT`。所以一个 `code` 被压成 `UNKNOWN` 的失败**不会被重试**——整个分组会把一次瞬时 429 变成一次死掉的回合，而且不报错，只是"没反应"。
+
+修法是给异常挂一个自己的 `failure` 数据属性（`{message, code, status}`）。这是**外部适配器**跨越该边界的正规做法，也是 `LlmError` 内部做的事；快照里的 `code` 必须和异常自身的 `code` 一致，否则边界会丢弃它。
+
+`test/failure-code.test.mjs` 钉住这条：它把真插件挂到真 `LlmService` 上，读**代理循环真正会看到的那个终止分片**。用 mock 的 `llm` 永远看不见这个 bug——假的 `llm` 不跑真边界。
+
+### 各种失败分别会怎样
+
+下表的 `/v1` 列是实测值（真插件挂真 `LlmService`，`hinds` 只有一个成员且它失败）：
+
+| 上游失败码 | `/v1` 状态 | `Retry-After` | DSH 会重试吗 |
+|---|---|---|---|
+| `RATE_LIMIT` | 429 | 有则输出 | **会** |
+| `SERVER` | 502 | 有则输出 | **会** |
+| `TIMEOUT` | 502 | — | **会** |
+| `TRANSPORT` | 502 | — | **会** |
+| `EMPTY_RESPONSE` | 502 | — | **会** |
+| `QUOTA` | 429 | 有则输出 | 不会 |
+| `AUTH` | 401 | — | 不会 |
+| `INVALID_CREDENTIAL` / `MISSING_CREDENTIAL` | 401 | — | 不会 |
+| `UNSUPPORTED_REASONING_EFFORT` | 400 | — | 不会 |
+| `CONTEXT_WINDOW_EXCEEDED` | 400 | — | 不会 |
+| `INVALID_REQUEST` | 400 | — | 不会 |
+| `ABORTED` | 499 | — | 不会 |
+| 其它 / 未知 | 502 | — | 不会 |
+
+三列读法：
+
+- **`/v1` 状态**：走 `statusForFailure`——**优先用上游自己报的 HTTP 状态**（`dsh-llm-deepseek` 会带上 `status: response.status`），没有才回退到按码分类。因为码比状态粗：`AUTH` 同时覆盖 401 和 403，而像 402 这种状态根本没有对应码。回退分类见 `statusForCode`。
+- **`Retry-After`**：只在**响应头还没发出去**时能给（非流式、或流式但第一个分片之前就失败）。SSE 一旦写出第一个分片就已经是 200 了，`Retry-After` 在协议上不可能再加；而且客户端已经收到半个流，重试这个响应也没意义。毫秒**向上取整**到秒，最小 1 秒——向下取整会变成"立刻重试"，正好是这个头要防的事。
+- **DSH 会重试吗**：判据是 `dsh-llm-retry` 的 `retryableCodes` 默认集合（`EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` / `TIMEOUT` / `TRANSPORT`）。**`QUOTA` 不在里面**：额度用尽重试也没用，直接报错更快。注意 `/v1` 路径**完全不重试**——它绕过了代理循环，重试只发生在 DSH 本体调用时。
+
+`ABORTED` 是特例：它被报成 `kind: 'aborted'` 而不是 `error`，所以网关**不会换腿**，`dsh-llm-retry` 也不会重试。这是对的——取消是调用方放弃，不是供应商失败，换腿等于复活一个刚被取消的请求。
+
+### 长会话自动压缩
+
+分组对外声明的上下文窗口是**所有候选里最小的那个**。DSH 的自动压缩按这个数算阈值，取最小值才能保证"快满了"在**任何**一条腿上都成立；取大的话，会话可能撑爆实际应答的那条腿。
+
+任何一条候选的窗口读不出来 → 整个窗口字段不输出。这不是保守：DSH 读不到窗口时只是警告一次然后继续跑（长会话最终可能撞上 `CONTEXT_WINDOW_EXCEEDED`），而**报一个错的数**会让每次压缩都算错，静默得多。
+
+两个事实（窗口、档位交集）在**同一次成员遍历**里取到，结果按分组缓存 30 秒；分组在设置页被增删改时缓存立即清空。
+
+### 分组名不能用下划线
+
+只能用字母、数字、`-` 和 `.`，且首字符必须是字母或数字。
+
+因为每个模型的对外名都是 `<供应商>_<模型>`，**下划线就是那个分隔符**。禁止分组名使用下划线，两个命名空间就天然不冲突，不需要任何优先级规则。
+
+分组名优先于模型名解析——但你不用记这条，符合规则的命名本来就撞不上。
+
+### 不支持的：嵌套分组
+
+候选模型必须是一个具体模型名，不能是另一个分组。分组套分组会让"这个候选到底是什么"无法判断，也会让上下文窗口的计算失去意义。
+
+### 推理强度（reasoning effort）
+
+分组对外声明的档位是**所有候选的交集**，并且**不设默认档**。
+
+交集，不是并集。并集会带来一个很隐蔽的故障：某一档只有部分候选支持，DSH 校验通过、放行，然后请求被转发给**不支持它的那条腿**，在请求中途以 `UNSUPPORTED_REASONING_EFFORT` 失败。改成交集后，DSH 自己就挡住了——调用方根本选不出没有任何一条腿能兑现的档位。
+
+**不设默认档**是必须的，不是保守。DSH 里的 `defaultEffort` 不是"提示"，而是**物化**：只要声明了它，每一个没有指定档位的请求都会被补上这个值（`dsh-llm` 的 `resolveCallWithInfo`）。这个值随后被原样转发给最终应答的那条腿——于是**调用方什么都没选，却收到了"不支持该档位"的报错**。分组横跨多个供应商，没有哪一档能代表所有成员，所以正确的做法是不替调用方做决定，让每条腿用它自己的默认值。
+
+具体表现：
+
+- 所有候选都声明了推理档位 → 取交集，聊天里出现档位选择器。
+- **任一候选没有声明推理档位**（该模型根本不接受这个参数）、或能力读不出来 → 交集为空 → **整个 `reasoning` 字段不输出**，选择器不出现。这是诚实的答案：分组无法承诺任何选择，就不该假装能。
+
+空交集时不能输出空的 `efforts` 数组——DSH 会以 `INVALID_MODEL_REASONING` 拒绝，而 `buildModelCatalog` 把"某个模型抛错"当成"整个 provider 失败"，结果是**整个 `dsh-model-relay` 从聊天选择器里消失**。
+
+`/v1` 那条路径是另一回事：**调用分组**时，显式传的 `reasoning_effort` 如果目标腿不支持，会被**丢弃并写警告**，而不是报 400。调用方指定的是分组，具体哪条腿应答由路由器决定，调用方无从校验，所以不该让它因此失败；档位是偏好，让上游用它自己的默认值继续跑，比整条请求失败要好，警告保证这件事不会被悄悄咽掉。
+
+**直接指定具体模型时不做这个处理**——模型和档位都是调用方自己选的，这时明确报错比悄悄丢掉它的指令更诚实。
+
+### 排查
+
+- 响应头 `x-relay-group`（分组名）和 `x-relay-model`（实际命中的那一条腿）直接告诉你走了谁。
+- 每次分组回退都会写日志，包括"换了下一个"和"这条腿解析不了"。
+- 所有候选都失败时，返回的是**最后一次失败的原始错误**，不是笼统的 503——这样上游的真实原因不会丢。
+- 如果某条腿不支持调用方指定的 `reasoning_effort`，日志里会有 `does not accept reasoning effort ...; dropping it`，请求本身继续。
+
+**什么算"可以换下一条腿"**：只有当这条腿**还没有吐出任何内容**时才算失败。一旦已经转发过 `block-start` / `text-delta` / `reasoning-delta` / `tool-call-delta` / `block-end`，响应就已经提交，再换腿会把调用方已经看到的内容重放一遍，所以此时失败就是最终结果。只有 `usage` 分片不算提交——它不携带任何模型输出。`aborted`（调用方自己取消）永远不触发换腿，否则会把刚被取消的工作重新拉起来。
+
+### 一个排查提示：设置页看得到，聊天里选不到
+
+这两处是**两条不同的路径**：
+
+| 位置 | 数据来源 |
+| --- | --- |
+| **设置 → 模型** | `llm.listProviders()` × `llm.listConfigurableProviders()`，按 settingsNs 拼装。**不碰适配器。** |
+| **聊天模型选择器** | `session.modelCatalog()` → `llm.listModels()` + `llm.resolveModelInfo()`。**会调适配器。** |
+
+所以如果**卡片在、但聊天里选不到**，几乎可以断定是**适配器抛错了**（返回给 DSH 的结构不合法）。这时去看 DSH 启动日志里 `dsh-model-relay 加载失败：...` 那条，它会直接给出原因。
 
 ## 模型名怎么写
 
@@ -158,7 +300,15 @@ use a namespaced id such as codebuddy_deepseek-v4-flash, deepseek-official_deeps
 
 - **接口地址**：Base URL、两个端点、一段可直接复制的 Python 示例
 - **API 密钥**：创建（带备注名）、删除、以及开启/关闭鉴权
+- **模型分组**：创建分组、增删候选模型、调整顺序
 - **可用模型**：当前暴露的模型清单
+
+### 分组是怎么存的
+
+- 存在 `~/.dsh/model-relay-groups.json`，和密钥**分开两个文件**。
+- 密钥文件那套"权限被放宽就当作不存在"的规则**不适用于分组**：那个规则是为凭据设计的，分组只是路由偏好，把它当成敌意文件会让功能无谓地失效。
+- 同样是原子替换 + 串行化队列。
+- 文件损坏或某条记录不可用时，**该条被丢弃而不是修复**——编一个名字或空候选列表只会造出一个永远无法服务的分组，那比它不存在更糟。
 
 ### 密钥是怎么处理的
 
@@ -259,6 +409,8 @@ http://<这台机器的局域网IP>:3081/v1
     apiKeys:
       - sk-your-key
     # 只暴露这些 provider，默认全部
+    # 填 [dsh-model-relay] 可以让外部只看到分组、看不到底层模型。
+    # 这是「对外」的过滤，不影响 DSH 自己能看到什么。
     providers:
       - codebuddy
     # 裸模型名的优先 provider
@@ -267,6 +419,8 @@ http://<这台机器的局域网IP>:3081/v1
     cors: true
     # 密钥存储路径，默认 <DSH_HOME>/model-relay-keys.json
     keysFile: /path/to/keys.json
+    # 分组存储路径，默认 <DSH_HOME>/model-relay-groups.json
+    groupsFile: /path/to/groups.json
     # 局域网独立监听端口（详见上文"局域网访问"）；false 或不写即关闭
     lanPort: 3081
     # 监听地址，默认 0.0.0.0
@@ -287,17 +441,47 @@ http://<这台机器的局域网IP>:3081/v1
 - **密钥管理只走设置页**。管理端点挂在 DSH 已鉴权的 connection carrier 上（`/api/model-relay`），`/v1` 自身不提供任何密钥管理接口。
 - **没有 `/v1/embeddings`、`/v1/images`** 等接口。这个网关只做对话和模型列表；DSH 的 `llm` 服务没有 embedding 能力，所以这里不会假装有。
 - **图片输入依赖附件服务**。`ctx.attachments` 没挂载时，带图请求会被明确拒绝（400），而不是静默丢图。
+- **分组回退只在首字节前有效**（见上文"模型分组"）。
+- **分组不能嵌套**。
+- **DSH 本体的会话不会经过 `/v1`**。它走的是 DSH 自己的 provider 通道；本插件注册 `dsh-model-relay` provider 是为了让分组出现在模型选择器里，不是为了把 DSH 的请求绕回自己的 HTTP 端口。所以给 `/v1` 开鉴权**不会**影响 DSH 本体。
 - 请求体上限 32 MiB，超出返回 413。
 
 ## 开发
 
 ```sh
-node --check lib/index.js && node --check lib/keys.js && node --check lib/client.js
-node test/gateway.test.mjs   # 协议翻译 + 路由 + 设置端点
-node test/keys.test.mjs      # 密钥存储：哈希、权限、并发、锁定语义
+npm run check                # 语法检查（含新增的 groups.js / adapter.js）
+npm test                     # 全部测试
 ```
 
-测试用假的 `llm` 服务和真实的 `node:http` 服务器驱动路由，验证 OpenAI 协议翻译的往返形状；密钥测试跑在真实临时目录上。都不需要登录账号，也不发外部请求。
+单独跑：
+
+```sh
+npm test                         # 跑全部 8 个套件，任一失败不影响其余
+node test/gateway.test.mjs       # 协议翻译 + 路由 + 分组回退 + 设置端点 + 状态码/Retry-After
+node test/keys.test.mjs          # 密钥存储：哈希、权限、并发、锁定语义
+node test/groups.test.mjs        # 分组存储：校验、并发、损坏降级
+node test/adapter.test.mjs       # 适配器单元测试（用 mock llm）
+node test/adapter-real.test.mjs  # 适配器对真实 dsh-llm 服务 —— 见下
+node test/registration.test.mjs  # provider 注册的三件套 + 档位交集是否正确接上
+node test/failure-code.test.mjs  # 失败码/重试提示能不能活着走到代理循环 —— 见下
+node test/verify-table.mjs       # 把上面那张失败表重新实测一遍，防止文档和行为漂移
+```
+
+`npm test` 走 `test/run.mjs`，每个套件独立进程、各自输出重定向到临时文件（Windows 上管道是命名管道，某些沙箱不允许创建）。**故意不用 `&&` 串联**：那样一个失败会静默吃掉后面所有套件，而 Windows 上恰好有一个必失败用例，于是 6 个套件里只有 1 个真的跑了。
+
+**`adapter-real.test.mjs` 不能用 mock 替代。** 它驱动真实的 `LlmService` 实例，让 DSH 自己的校验器当裁判。
+
+原因是踩过一次：`reasoning.efforts` 写成了字符串数组 `['low','medium','high']`，而 DSH 期望 `{id, name}` 对象数组。用 mock 测完全绿——mock 把坏值原样吐回来。真实服务立刻抛 `INVALID_MODEL_REASONING`，整个 provider 从聊天选择器里消失（但设置页仍显示卡片，因为那条路径不碰适配器）。
+
+**同一个盲区后来咬过两次，形状各不相同。** 第一次：mock 让适配器**抛异常**来表示失败，但真实 `dsh-llm` 不会让适配器异常逃出去——它在自己的边界捕获，转成一个 `{type:'finish', reason:{kind:'error'}}` **分片**（`adapterStream` / `adapterFailureChunk`）。回退循环只看 `next.done`，于是把这个错误分片当成正常结果直接透传，`started` 也被置为 true——**真实运行时的分组回退从来没生效过**，而所有 mock 测试全绿。现在 `test/gateway.test.mjs` 两种形状都测。
+
+第二次：**失败码**。所有候选都挂掉后网关抛出的 `GatewayError` 要穿过 DSH 边界，而边界只认 `HarnessError` 的 `code`，其余压成 `UNKNOWN`。`dsh-llm-retry` 按 `failure.code` 决定重不重试，于是分组整体失败时**一次都不会被重试**——但没有任何测试看得见，因为假的 `llm` 不跑真边界，`code` 是什么它都原样返回。见 `test/failure-code.test.mjs`。
+
+**规则**：任何交给 DSH 消费的结构（`listModels` / `resolveModel` 的返回值），都必须用真实服务实例验证。mock 只能证明"我传了我以为对的东西"，证明不了"对方接受它"。同理，**mock 的失败方式也必须和真实运行时一致**——失败是抛出来的还是当值返回的，会决定一整条控制流走不走得到；**而失败携带的 `code` 会被边界重写**，所以"错误信息对了"不等于"错误码还在"。
+
+测试用假的 `llm` 服务和真实的 `node:http` 服务器驱动路由，验证 OpenAI 协议翻译的往返形状；存储测试跑在真实临时目录上。都不需要登录账号，也不发外部请求。
+
+**三个已知的 Windows 上会失败的用例**（与本次改动无关，改动前就是这个结果）：`gateway.test.mjs` 的局域网地址过滤（依赖 Linux 的 `/proc/net/route`）、`keys.test.mjs` 的两个 POSIX 文件权限用例（Windows 没有 POSIX mode，`keys.js` 在 win32 上直接跳过检查）。
 
 > **改了代码后确认一下安装副本。** pnpm 对 `file:` 依赖用的是**硬链接**（不是拷贝，也不是软链）：源文件和 `node_modules` 里的副本是同一个 inode。
 >
