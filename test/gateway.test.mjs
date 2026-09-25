@@ -1617,5 +1617,327 @@ await test('a rejection of the request itself answers 400, not 502', async () =>
   })
 })
 
+// ---------------------------------------------------------------------------
+// Group scheduling: ordering strategies and the rate-limit retry
+// ---------------------------------------------------------------------------
+
+/** Create a group with an explicit scheduling pair. */
+async function createScheduledGroup(settingsRoutes, name, models, strategy, retry429) {
+  return callSettings(settingsRoutes, 'createGroup', { name, models, strategy, retry429 })
+}
+
+await test('a group defaults to sequential with no retry, exactly as before', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async () => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const stored = (await callSettings(settingsRoutes, 'listGroups')).value.groups[0]
+    assert.equal(stored.strategy, 'sequential')
+    assert.equal(stored.retry429, 0)
+  })
+})
+
+await test('an unusable scheduling value is stored as the default, not rejected', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async () => {
+    const created = await createScheduledGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'], 'nonsense', 99)
+    assert.equal(created.ok, true, 'a scheduling preference must never cost the group')
+    assert.equal(created.value.group.strategy, 'sequential')
+    assert.equal(created.value.group.retry429, 3, 'clamped to the accepted maximum')
+  })
+})
+
+await test('round-robin advances the starting candidate across requests', async () => {
+  const { ctx, routes, settingsRoutes, streamCalls } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createScheduledGroup(settingsRoutes, 'rr', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'], 'round-robin', 0)
+    const heads = []
+    for (let request = 0; request < 3; request += 1) {
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'rr', messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      assert.equal(res.status, 200)
+      heads.push(streamCalls.at(-1).provider)
+    }
+    // Two candidates, so the head alternates rather than staying put.
+    assert.deepEqual(heads, ['codebuddy', 'deepseek', 'codebuddy'])
+  })
+})
+
+await test('random picks a candidate that is actually in the group', async () => {
+  const { ctx, routes, settingsRoutes, streamCalls } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createScheduledGroup(settingsRoutes, 'rnd', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'], 'random', 0)
+    const seen = new Set()
+    for (let request = 0; request < 12; request += 1) {
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'rnd', messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      assert.equal(res.status, 200)
+      seen.add(streamCalls.at(-1).provider)
+    }
+    for (const provider of seen) assert.equal(['codebuddy', 'deepseek'].includes(provider), true)
+  })
+})
+
+await test('a rotating group still fails over, so the permutation keeps its fallback', async () => {
+  const { ctx, routes, settingsRoutes, streamCalls } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* failing() {
+        throw Object.assign(new Error('unavailable'), { code: 'MISSING_CREDENTIAL' })
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createScheduledGroup(settingsRoutes, 'rr', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'], 'round-robin', 0)
+    // Whatever the rotation puts first, the dead member must not end the call.
+    for (let request = 0; request < 4; request += 1) {
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'rr', messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      assert.equal(res.status, 200, `request ${request} must fail over to the healthy member`)
+      assert.equal(res.headers.get('x-relay-model'), 'deepseek_deepseek-chat')
+    }
+  })
+})
+
+await test('retry429 re-asks the SAME candidate before moving on', async () => {
+  let codebuddyAttempts = 0
+  const { ctx, routes, settingsRoutes, streamCalls } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      codebuddyAttempts += 1
+      // Rate limited once, then healthy: a retry is what recovers this.
+      if (codebuddyAttempts === 1) {
+        return (async function* limited() {
+          yield failureChunk('RATE_LIMIT', 'slow down')
+        })()
+      }
+      return undefined
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createScheduledGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'], 'sequential', 1)
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal(codebuddyAttempts, 2, 'the rate-limited candidate is asked exactly twice')
+    assert.equal(res.headers.get('x-relay-model'), 'codebuddy_glm-5.2', 'the retry kept the same candidate')
+  })
+})
+
+await test('retry429 stops after the configured number of retries', async () => {
+  let attempts = 0
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      attempts += 1
+      return (async function* alwaysLimited() {
+        yield failureChunk('RATE_LIMIT', 'slow down')
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createScheduledGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'], 'sequential', 2)
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    // 1 initial + 2 retries, then the next candidate serves it.
+    assert.equal(attempts, 3)
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('x-relay-model'), 'deepseek_deepseek-chat')
+  })
+})
+
+await test('retry429 does NOT retry an exhausted quota, which also answers 429', async () => {
+  let attempts = 0
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      attempts += 1
+      return (async function* outOfQuota() {
+        // QUOTA maps to HTTP 429 through statusForCode, so judging by status
+        // instead of by code would retry this pointlessly.
+        yield failureChunk('QUOTA', 'out of quota')
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createScheduledGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'], 'sequential', 3)
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(attempts, 1, 'an exhausted quota must not be retried')
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('x-relay-model'), 'deepseek_deepseek-chat')
+  })
+})
+
+await test('a retry hint longer than the budget moves on instead of sleeping', async () => {
+  let attempts = 0
+  const { ctx, routes, settingsRoutes, warnings } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      attempts += 1
+      return (async function* longQuiet() {
+        // 30s, far past the per-candidate budget.
+        yield failureChunk('RATE_LIMIT', 'slow down', 30000)
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createScheduledGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'], 'sequential', 2)
+    const started = Date.now()
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(attempts, 1, 'a hint past the budget is not waited out')
+    assert.equal(res.status, 200)
+    // The point of the budget: the caller is not made to sit through 30s.
+    assert.equal(Date.now() - started < 5000, true, 'the request must not wait out the hint')
+    assert.equal(warnings.some((line) => typeof line === 'string' && line.includes('budget exceeded')), true)
+  })
+})
+
+await test('a failure after output is committed is never retried', async () => {
+  let attempts = 0
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      attempts += 1
+      return (async function* diesAfterOutput() {
+        yield { type: 'text-delta', index: 0, text: 'partial' }
+        yield failureChunk('RATE_LIMIT', 'slow down')
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createScheduledGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'], 'sequential', 3)
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+    })
+    const body = await res.text()
+    // Replaying already-forwarded content would duplicate it in the client.
+    assert.equal(attempts, 1)
+    assert.equal(body.includes('slow down'), true)
+  })
+})
+
+await test('a group whose FIRST candidate cannot be resolved still fails over', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    // A candidate naming this gateway is refused by resolveLeg. Writing it
+    // directly is the only way to reach this: the settings UI only offers ids
+    // that resolve. The failure must not escape and fail the whole request.
+    const created = await createScheduledGroup(
+      settingsRoutes,
+      'g',
+      ['dsh-model-relay_ghost', 'deepseek_deepseek-chat'],
+      'sequential',
+      0,
+    )
+    assert.equal(created.ok, true)
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200, 'the healthy second candidate must serve the request')
+    assert.equal(res.headers.get('x-relay-model'), 'deepseek_deepseek-chat')
+  })
+})
+
+await test('a group whose only candidate cannot be resolved reports that failure', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createScheduledGroup(settingsRoutes, 'g', ['dsh-model-relay_ghost'], 'sequential', 0)
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    // Nothing was usable, so the real reason must surface rather than a 503.
+    assert.notEqual(res.status, 200)
+    assert.equal((await res.json()).error.code, 'group_self_reference')
+  })
+})
+
+await test('scheduling survives the settings round trip and is clamped on update', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async () => {
+    await createScheduledGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'], 'sequential', 0)
+    assert.equal((await callSettings(settingsRoutes, 'updateGroup', { id: 'g', strategy: 'round-robin', retry429: 2 })).ok, true)
+    const stored = (await callSettings(settingsRoutes, 'listGroups')).value.groups[0]
+    assert.equal(stored.strategy, 'round-robin')
+    assert.equal(stored.retry429, 2)
+
+    // An update that omits the fields must not reset them.
+    assert.equal((await callSettings(settingsRoutes, 'updateGroup', { id: 'g', models: ['deepseek_deepseek-chat'] })).ok, true)
+    const after = (await callSettings(settingsRoutes, 'listGroups')).value.groups[0]
+    assert.equal(after.strategy, 'round-robin')
+    assert.equal(after.retry429, 2)
+  })
+})
+
+
+await test('a stored pair reopens on the preset that preserves it', async () => {
+  // The mapping lives in the browser half, but the failure it guards against
+  // is a data-loss one: opening a group and pressing confirm must not rewrite
+  // its scheduling. Reproduced here against the same preset table the client
+  // uses, because a client-only mistake is invisible to every other suite.
+  const PRESETS = [
+    { id: 'sequential', strategy: 'sequential', retry429: 0 },
+    { id: 'balanced', strategy: 'round-robin', retry429: 0 },
+    { id: 'random', strategy: 'random', retry429: 0 },
+    { id: 'retry', strategy: 'sequential', retry429: 1 },
+  ]
+  const presetOf = (strategy, retry429) => {
+    if ((retry429 ?? 0) > 0) return 'retry'
+    return PRESETS.find((preset) => preset.strategy === strategy && preset.retry429 === 0)?.id ?? 'sequential'
+  }
+  // A document that omits retry429 entirely — the shape a hand-written or
+  // older file has — must still land on its own strategy.
+  assert.equal(presetOf('random', undefined), 'random')
+  assert.equal(presetOf('round-robin', undefined), 'balanced')
+  assert.equal(presetOf('sequential', undefined), 'sequential')
+  assert.equal(presetOf('random', 0), 'random')
+  assert.equal(presetOf('round-robin', 0), 'balanced')
+  // Any retry count belongs to the one preset that carries one.
+  assert.equal(presetOf('sequential', 1), 'retry')
+  assert.equal(presetOf('sequential', 3), 'retry')
+  // An unknown strategy still opens somewhere editable.
+  assert.equal(presetOf('nonsense', 0), 'sequential')
+})
+
 console.log(failures === 0 ? '\nAll gateway translation tests passed.' : `\n${failures} test(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

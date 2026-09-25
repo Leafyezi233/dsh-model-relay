@@ -162,9 +162,14 @@ await test('the persisted file is valid JSON with a versioned shape', async () =
     const store = new GatewayGroupStore({ file })
     await store.create('g', ['a_b'])
     const parsed = JSON.parse(await readFile(file, 'utf8'))
-    assert.equal(parsed.version, 1)
+    // Bumped when scheduling was added. The version is descriptive only —
+    // 'load' never reads it — so an older plugin reading this file ignores the
+    // new fields rather than refusing the document.
+    assert.equal(parsed.version, 2)
     assert.equal(Array.isArray(parsed.groups), true)
     assert.equal(parsed.groups[0].name, 'g')
+    assert.equal(parsed.groups[0].strategy, 'sequential')
+    assert.equal(parsed.groups[0].retry429, 0)
   })
 })
 
@@ -177,6 +182,104 @@ await test('a returned group is a copy, so mutating it cannot corrupt the store'
     assert.deepEqual((await store.get('g')).models, ['a_b'])
   })
 })
+
+await test('a group created without scheduling defaults to sequential and no retry', async () => {
+  await withStore(async (file) => {
+    const store = new GatewayGroupStore({ file })
+    const created = await store.create('g', ['a_b'])
+    assert.equal(created.group.strategy, 'sequential')
+    assert.equal(created.group.retry429, 0)
+    const hit = await store.get('g')
+    assert.equal(hit.strategy, 'sequential')
+    assert.equal(hit.retry429, 0)
+  })
+})
+
+await test('scheduling round-trips through the file', async () => {
+  await withStore(async (file) => {
+    const store = new GatewayGroupStore({ file })
+    await store.create('g', ['a_b'], { strategy: 'round-robin', retry429: 2 })
+    const reopened = new GatewayGroupStore({ file })
+    const hit = await reopened.get('g')
+    assert.equal(hit.strategy, 'round-robin')
+    assert.equal(hit.retry429, 2)
+  })
+})
+
+await test('an unusable scheduling value degrades instead of dropping the group', async () => {
+  await withStore(async (file) => {
+    const store = new GatewayGroupStore({ file })
+    // A scheduling preference must never cost a working candidate list.
+    const created = await store.create('g', ['a_b'], { strategy: 'nonsense', retry429: 99 })
+    assert.equal(created.ok, true)
+    assert.equal(created.group.strategy, 'sequential')
+    assert.equal(created.group.retry429, 3)
+  })
+})
+
+await test('a document written before scheduling existed still loads', async () => {
+  await withStore(async (file) => {
+    // The exact shape the previous version persisted: no strategy, no retry.
+    await writeFile(file, JSON.stringify({
+      version: 1,
+      groups: [{ id: 'old', name: 'old', models: ['a_b'], enabled: true }],
+    }), 'utf8')
+    const store = new GatewayGroupStore({ file })
+    const hit = await store.get('old')
+    assert.equal(hit.name, 'old')
+    assert.deepEqual(hit.models, ['a_b'])
+    assert.equal(hit.strategy, 'sequential')
+    assert.equal(hit.retry429, 0)
+  })
+})
+
+await test('a stored but unusable scheduling value is normalized on read', async () => {
+  await withStore(async (file) => {
+    await writeFile(file, JSON.stringify({
+      version: 2,
+      groups: [
+        { name: 'a', models: ['m_n'], strategy: 'wat', retry429: 'two' },
+        { name: 'b', models: ['m_n'], strategy: 'random', retry429: -4 },
+      ],
+    }), 'utf8')
+    const store = new GatewayGroupStore({ file })
+    const a = await store.get('a')
+    assert.equal(a.strategy, 'sequential')
+    assert.equal(a.retry429, 0)
+    const b = await store.get('b')
+    assert.equal(b.strategy, 'random')
+    assert.equal(b.retry429, 0)
+  })
+})
+
+await test('update changes scheduling, and omitting it preserves the current pair', async () => {
+  await withStore(async (file) => {
+    const store = new GatewayGroupStore({ file })
+    await store.create('g', ['a_b'], { strategy: 'random', retry429: 1 })
+
+    assert.equal((await store.update('g', { models: ['c_d'] })).ok, true)
+    const kept = await store.get('g')
+    assert.equal(kept.strategy, 'random', 'an unrelated update must not reset scheduling')
+    assert.equal(kept.retry429, 1)
+
+    assert.equal((await store.update('g', { strategy: 'round-robin', retry429: 3 })).ok, true)
+    const changed = await store.get('g')
+    assert.equal(changed.strategy, 'round-robin')
+    assert.equal(changed.retry429, 3)
+  })
+})
+
+await test('a rename carries scheduling along', async () => {
+  await withStore(async (file) => {
+    const store = new GatewayGroupStore({ file })
+    await store.create('g', ['a_b'], { strategy: 'round-robin', retry429: 2 })
+    await store.update('g', { name: 'h' })
+    const renamed = await store.get('h')
+    assert.equal(renamed.strategy, 'round-robin')
+    assert.equal(renamed.retry429, 2)
+  })
+})
+
 
 if (failures > 0) {
   console.log(`\n${failures} failing`)

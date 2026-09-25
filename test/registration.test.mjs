@@ -30,11 +30,13 @@ let seq = 0
 const files = () => ({ keysFile: join(dir, `k${seq}.json`), groupsFile: join(dir, `g${seq++}.json`) })
 
 /** A fake context whose llm service records registration calls. */
-function makeCtx({ withLlm = true, withSettings = true, efforts, window } = {}) {
+function makeCtx({ withLlm = true, withSettings = true, efforts, window, streamFor } = {}) {
   const registered = { providers: [], adapters: [], sections: [], disposed: 0 }
   const infos = []
   const warnings = []
   const capabilityReads = []
+  /** Every dispatch the gateway made, in order, as `provider/model`. */
+  const streamCalls = []
   const ctx = {
     logger: { info: (m) => infos.push(m), warn: (m) => warnings.push(m) },
     effect: (fn) => {
@@ -68,7 +70,12 @@ function makeCtx({ withLlm = true, withSettings = true, efforts, window } = {}) 
     ctx.llm = {
       listProviders: () => [{ id: 'codebuddy', name: 'CodeBuddy' }],
       listModels: async (provider) => [{ provider, id: 'glm-5.2', name: 'GLM' }],
-      stream: () => (async function* generate() { yield { type: 'text-delta', index: 0, text: 'x' } })(),
+      stream: (options) => {
+        streamCalls.push(`${options.provider}/${options.model}`)
+        const scripted = streamFor?.(options)
+        if (scripted !== undefined) return scripted
+        return (async function* generate() { yield { type: 'text-delta', index: 0, text: 'x' } })()
+      },
       /**
        * Per-member capability, so the group's intersection is observable here.
        * `efforts` maps a model id to that member's declared list; an id absent
@@ -95,17 +102,33 @@ function makeCtx({ withLlm = true, withSettings = true, efforts, window } = {}) 
       },
     }
   }
-  return { ctx, registered, infos, warnings, capabilityReads }
+  return { ctx, registered, infos, warnings, capabilityReads, streamCalls }
 }
 
 /** Write a groups file naming the given members, and return the mount config. */
-function groupsWith(members) {
+function groupsWith(members, scheduling = {}) {
   const config = files()
   writeFileSync(config.groupsFile, JSON.stringify({
-    version: 1,
-    groups: [{ id: 'g', name: 'g', models: members, enabled: true }],
+    version: 2,
+    groups: [{ id: 'g', name: 'g', models: members, enabled: true, ...scheduling }],
   }))
   return config
+}
+
+/** A terminal failure chunk, in the shape `dsh-llm` actually produces. */
+const failureChunk = (code, message, providerRetryAfterMs) => ({
+  type: 'finish',
+  reason: {
+    kind: 'error',
+    failure: { code, message, ...(providerRetryAfterMs === undefined ? {} : { providerRetryAfterMs }) },
+  },
+})
+
+/** Drain one adapter stream into an array of chunks. */
+async function drain(iterable) {
+  const chunks = []
+  for await (const chunk of iterable) chunks.push(chunk)
+  return chunks
 }
 
 await test('the gateway registers itself as a DSH provider', async () => {
@@ -255,6 +278,103 @@ await test('a group naming an unreachable member advertises nothing rather than 
   assert.equal('reasoning' in resolved, false)
   assert.equal('context' in resolved, false)
 })
+
+/**
+ * Scheduling on the DSH-side path.
+ *
+ * These drive the adapter the gateway actually registered, so the ordering and
+ * the rate-limit retry are exercised through `streamGroup` — the same walk
+ * `/v1` uses. The two entry points must not drift, and this is what pins the
+ * DSH half of that.
+ */
+
+await test('the DSH-side stream tries candidates in the stored order', async () => {
+  const { ctx, registered, streamCalls } = makeCtx()
+  apply(ctx, groupsWith(['codebuddy_glm-5.2', 'codebuddy_chat']))
+  const adapter = registered.adapters[0].adapter
+  await drain(adapter.stream({ model: 'g' }))
+  assert.deepEqual(streamCalls, ['codebuddy/glm-5.2'])
+})
+
+await test('the DSH-side stream rotates a balanced group between calls', async () => {
+  const { ctx, registered, streamCalls } = makeCtx()
+  apply(ctx, groupsWith(['codebuddy_glm-5.2', 'codebuddy_chat'], { strategy: 'round-robin' }))
+  const adapter = registered.adapters[0].adapter
+  for (let call = 0; call < 3; call += 1) await drain(adapter.stream({ model: 'g' }))
+  // Two members, so the head alternates instead of sticking.
+  assert.deepEqual(streamCalls, ['codebuddy/glm-5.2', 'codebuddy/chat', 'codebuddy/glm-5.2'])
+})
+
+await test('the DSH-side stream fails over when the first member dies before output', async () => {
+  const { ctx, registered, streamCalls, warnings } = makeCtx({
+    streamFor: (options) => {
+      if (options.model !== 'glm-5.2') return undefined
+      return (async function* failing() { throw Object.assign(new Error('gone'), { code: 'MISSING_CREDENTIAL' }) })()
+    },
+  })
+  apply(ctx, groupsWith(['codebuddy_glm-5.2', 'codebuddy_chat']))
+  const adapter = registered.adapters[0].adapter
+  const chunks = await drain(adapter.stream({ model: 'g' }))
+  // The healthy member served it; the caller never sees the dead one.
+  assert.equal(chunks.some((chunk) => chunk.type === 'text-delta'), true)
+  assert.deepEqual(streamCalls, ['codebuddy/glm-5.2', 'codebuddy/chat'])
+  assert.equal(warnings.some((line) => typeof line === 'string' && line.includes('trying the next')), true)
+})
+
+await test('the DSH-side stream retries a rate-limited member on the same candidate', async () => {
+  let attempts = 0
+  const { ctx, registered, streamCalls } = makeCtx({
+    streamFor: (options) => {
+      if (options.model !== 'glm-5.2') return undefined
+      attempts += 1
+      if (attempts === 1) {
+        return (async function* limited() { yield failureChunk('RATE_LIMIT', 'slow down') })()
+      }
+      return undefined
+    },
+  })
+  apply(ctx, groupsWith(['codebuddy_glm-5.2', 'codebuddy_chat'], { strategy: 'sequential', retry429: 1 }))
+  const adapter = registered.adapters[0].adapter
+  const chunks = await drain(adapter.stream({ model: 'g' }))
+  // This is the point of enabling the retry on the DSH path: the rate limit is
+  // absorbed here instead of being handed to the agent loop, which would spend
+  // one of its own five retries on it.
+  assert.deepEqual(streamCalls, ['codebuddy/glm-5.2', 'codebuddy/glm-5.2'])
+  assert.equal(attempts, 2)
+  assert.equal(chunks.some((chunk) => chunk.type === 'text-delta'), true)
+})
+
+await test('the DSH-side stream does not retry an exhausted quota', async () => {
+  const { ctx, registered, streamCalls } = makeCtx({
+    streamFor: (options) => {
+      if (options.model !== 'glm-5.2') return undefined
+      return (async function* outOfQuota() { yield failureChunk('QUOTA', 'out of quota') })()
+    },
+  })
+  apply(ctx, groupsWith(['codebuddy_glm-5.2', 'codebuddy_chat'], { strategy: 'sequential', retry429: 3 }))
+  const adapter = registered.adapters[0].adapter
+  await drain(adapter.stream({ model: 'g' }))
+  assert.deepEqual(streamCalls, ['codebuddy/glm-5.2', 'codebuddy/chat'])
+})
+
+await test('the DSH-side stream never retries after output was yielded', async () => {
+  const { ctx, registered, streamCalls } = makeCtx({
+    streamFor: (options) => {
+      if (options.model !== 'glm-5.2') return undefined
+      return (async function* diesAfterOutput() {
+        yield { type: 'text-delta', index: 0, text: 'partial' }
+        yield failureChunk('RATE_LIMIT', 'slow down')
+      })()
+    },
+  })
+  apply(ctx, groupsWith(['codebuddy_glm-5.2', 'codebuddy_chat'], { strategy: 'sequential', retry429: 3 }))
+  const adapter = registered.adapters[0].adapter
+  const chunks = await drain(adapter.stream({ model: 'g' }))
+  // Replaying would duplicate content the consumer already received.
+  assert.deepEqual(streamCalls, ['codebuddy/glm-5.2'])
+  assert.equal(chunks.some((chunk) => chunk.type === 'text-delta'), true)
+})
+
 
 if (failures > 0) {
   console.log(`\n${failures} failing`)

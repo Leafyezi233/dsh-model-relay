@@ -1,7 +1,7 @@
 {
   "name": "@leaf233/dsh-model-relay",
   "displayName": "模型中转站",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Model relay station for DeepSeek Harness (模型中转站): serve any registered DSH LLM provider (e.g. @tnnevol/dsh-codebuddy) over an OpenAI-compatible /v1 API, so other projects can call those models with a standard OpenAI client.",
   "type": "module",
   "license": "Apache-2.0",
@@ -82,7 +82,7 @@
     }
   },
   "scripts": {
-    "check": "node --check lib/index.js && node --check lib/keys.js && node --check lib/groups.js && node --check lib/adapter.js && node --check lib/client.js",
+    "check": "node --check lib/index.js && node --check lib/keys.js && node --check lib/groups.js && node --check lib/strategy.js && node --check lib/adapter.js && node --check lib/client.js",
     "test": "node test/run.mjs"
   }
 }
