@@ -2201,5 +2201,74 @@ await test('the scoreboard survives an edit that does not change the members', a
   })
 })
 
+await test('a group whose every candidate is unresolvable still records the attempt', async () => {
+  // A self-referencing member cannot resolve, so this is the one group shape
+  // that never reaches the failover loop. The request still happened, and a
+  // scoreboard that silently drops it is worse than one that shows zeroes.
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['dsh-model-relay_a', 'dsh-model-relay_b'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.notEqual(res.status, 200)
+    await res.text()
+
+    const listed = await callSettings(settingsRoutes, 'listGroups')
+    assert.equal(listed.value.stats.g?.requests, 1, 'the request must be counted')
+    assert.equal(listed.value.stats.g?.allFailed, 1, 'and recorded as having served nobody')
+    assert.equal(statsRow(listed, 'g', 'dsh-model-relay_a').ignored, 1, 'a misconfigured member is excused, not blamed')
+    assert.equal(statsRow(listed, 'g', 'dsh-model-relay_b').ignored, 1)
+  })
+})
+
+await test('a legacy slash candidate is keyed the way the group stores it', async () => {
+  // The stored spelling and the resolved one differ for the legacy
+  // `provider/model` form. The settings page looks candidates up from the
+  // stored list, so keying by the resolved spelling would show nothing.
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy/glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200)
+    await res.text()
+
+    const listed = await callSettings(settingsRoutes, 'listGroups')
+    const stored = listed.value.groups[0].models[0]
+    assert.equal(stored, 'codebuddy/glm-5.2', 'the group still stores the legacy spelling')
+    assert.ok(listed.value.stats.g.candidates[stored] !== undefined,
+      'the row must be keyed by the stored spelling, or the page finds nothing')
+  })
+})
+
+await test('an attempt is answered at most once', async () => {
+  // The DSH-side loop scores an attempt at its first committing chunk and then
+  // returns through a second scoring site. Without a guard the same answer is
+  // counted twice, which shows up as more answers than attempts.
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await res.text()
+
+    const row = statsRow(await callSettings(settingsRoutes, 'listGroups'), 'g', 'codebuddy_glm-5.2')
+    assert.equal(row.answered, 1)
+    assert.ok(row.answered <= row.attempts, 'an answer cannot outnumber its attempts')
+  })
+})
+
 console.log(failures === 0 ? '\nAll gateway translation tests passed.' : `\n${failures} test(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)
