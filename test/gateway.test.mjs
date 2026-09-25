@@ -1939,5 +1939,267 @@ await test('a stored pair reopens on the preset that preserves it', async () => 
   assert.equal(presetOf('nonsense', 0), 'sequential')
 })
 
+/** The stats row for one candidate, or a readable failure. */
+const statsRow = (listed, group, model) => {
+  const row = listed.value.stats?.[group]?.candidates?.[model]
+  assert.ok(row !== undefined, `no stats row for ${group}/${model}`)
+  return row
+}
+
+await test('failover charges the refusal to the candidate that actually failed', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* failing() {
+        throw Object.assign(new Error('credential unavailable'), { code: 'MISSING_CREDENTIAL' })
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200)
+    await res.text()
+
+    const listed = await callSettings(settingsRoutes, 'listGroups')
+    const failed = statsRow(listed, 'g', 'codebuddy_glm-5.2')
+    const served = statsRow(listed, 'g', 'deepseek_deepseek-chat')
+    // The blame must land on the candidate that broke, not on the one that
+    // rescued the request — that inversion is the whole risk of a scoreboard.
+    assert.equal(failed.refused, 1)
+    assert.equal(failed.answered, 0)
+    assert.equal(failed.lastCode, 'MISSING_CREDENTIAL')
+    assert.equal(failed.ratio, 0)
+    assert.equal(served.answered, 1)
+    assert.equal(served.refused, 0)
+    assert.equal(served.ratio, 1)
+    assert.equal(listed.value.stats.g.requests, 1)
+    assert.equal(listed.value.stats.g.allFailed, 0)
+  })
+})
+
+await test('a group whose every candidate fails records an all-failed request', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: () => (async function* failing() {
+      throw Object.assign(new Error('nope'), { code: 'MISSING_CREDENTIAL', status: 502 })
+    })(),
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.notEqual(res.status, 200)
+    await res.text()
+
+    const listed = await callSettings(settingsRoutes, 'listGroups')
+    assert.equal(listed.value.stats.g.requests, 1)
+    assert.equal(listed.value.stats.g.allFailed, 1)
+    assert.equal(statsRow(listed, 'g', 'codebuddy_glm-5.2').refused, 1)
+    assert.equal(statsRow(listed, 'g', 'deepseek_deepseek-chat').refused, 1)
+  })
+})
+
+await test('a retried rate limit is counted, and the answer still counts as one', async () => {
+  // The counter lives outside `streamFor`: a retry calls it again, so a
+  // per-call closure would restart the script and never reach the answer.
+  let asks = 0
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* limited() {
+        asks += 1
+        if (asks === 1) {
+          yield failureChunk('RATE_LIMIT', 'slow down')
+          return
+        }
+        yield* textChunks
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createScheduledGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'], 'sequential', 2)
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200)
+    await res.text()
+
+    const row = statsRow(await callSettings(settingsRoutes, 'listGroups'), 'g', 'codebuddy_glm-5.2')
+    // Two attempts, one answer: "needed two asks" must not read as two
+    // successes, nor as a failure.
+    assert.equal(row.attempts, 2)
+    assert.equal(row.retry429, 1)
+    assert.equal(row.answered, 1)
+    assert.equal(row.refused, 1, 'the rate-limited attempt itself was a refusal')
+  })
+})
+
+await test('a failure the candidate is not responsible for is excused', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: () => (async function* tooBig() {
+      throw Object.assign(new Error('too long'), { code: 'CONTEXT_WINDOW_EXCEEDED' })
+    })(),
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.notEqual(res.status, 200)
+    await res.text()
+
+    const row = statsRow(await callSettings(settingsRoutes, 'listGroups'), 'g', 'codebuddy_glm-5.2')
+    // An oversized request fails identically on every candidate, so it must
+    // not be held against this one.
+    assert.equal(row.ignored, 1)
+    assert.equal(row.refused, 0)
+    assert.equal(row.ratio, undefined, 'nothing that blames the candidate was counted')
+  })
+})
+
+await test('a committed failure mid-stream counts as answered, on purpose', async () => {
+  // This pins a known, accepted loss of detail rather than a bug. On `/v1` the
+  // committed attempt is handed off as `resume(...)` and `openStream` cannot
+  // see the later failure, so "answered" is the only question both paths can
+  // answer identically. If this assertion ever fails, the statistics were made
+  // more precise — update the docs in `lib/stats.js` rather than reverting it.
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* halfThenFail() {
+        yield { type: 'block-start', index: 0 }
+        yield { type: 'text-delta', text: 'partial' }
+        throw Object.assign(new Error('died mid-stream'), { code: 'SERVER' })
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await res.text()
+
+    const row = statsRow(await callSettings(settingsRoutes, 'listGroups'), 'g', 'codebuddy_glm-5.2')
+    assert.equal(row.answered, 1, 'output had already been produced')
+    assert.equal(row.refused, 0)
+  })
+})
+
+await test('a direct model call is never scored', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codebuddy_glm-5.2', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 200)
+    await res.text()
+
+    // A direct call has no candidate list to compare against, so the scoreboard
+    // must stay empty rather than growing an entry per model name.
+    const listed = await callSettings(settingsRoutes, 'listGroups')
+    assert.deepEqual(listed.value.stats, {})
+  })
+})
+
+await test('renaming a group carries its scoreboard over', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* failing() {
+        throw Object.assign(new Error('nope'), { code: 'SERVER' })
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await res.text()
+    assert.equal((await callSettings(settingsRoutes, 'updateGroup', { id: 'g', name: 'renamed' })).ok, true)
+
+    const listed = await callSettings(settingsRoutes, 'listGroups')
+    assert.equal(listed.value.stats.g, undefined, 'the old name is gone')
+    assert.equal(statsRow(listed, 'renamed', 'codebuddy_glm-5.2').refused, 1, 'the history survived')
+  })
+})
+
+await test('dropping a candidate forgets its row, and removing a group forgets all of it', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks, {
+    // The FIRST candidate fails so the second is actually reached: both then
+    // have a row, which is what makes the drop-one-keep-the-other assertion
+    // meaningful.
+    streamFor: (options) => {
+      if (options.provider !== 'codebuddy') return undefined
+      return (async function* failing() {
+        throw Object.assign(new Error('nope'), { code: 'SERVER' })
+      })()
+    },
+  })
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2', 'deepseek_deepseek-chat'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await res.text()
+    assert.equal(statsRow(await callSettings(settingsRoutes, 'listGroups'), 'g', 'codebuddy_glm-5.2').refused, 1)
+
+    await callSettings(settingsRoutes, 'updateGroup', { id: 'g', models: ['deepseek_deepseek-chat'] })
+    const afterEdit = await callSettings(settingsRoutes, 'listGroups')
+    assert.equal(afterEdit.value.stats.g.candidates['codebuddy_glm-5.2'], undefined, 'the removed candidate is forgotten')
+    assert.equal(statsRow(afterEdit, 'g', 'deepseek_deepseek-chat').answered, 1, 'the kept candidate keeps its history')
+
+    await callSettings(settingsRoutes, 'removeGroup', { id: 'g' })
+    assert.equal((await callSettings(settingsRoutes, 'listGroups')).value.stats.g, undefined)
+  })
+})
+
+await test('the scoreboard survives an edit that does not change the members', async () => {
+  const { ctx, routes, settingsRoutes } = makeCtx(textChunks)
+  mount(ctx, {})
+  await withServer(routes, async (base) => {
+    await createGroup(settingsRoutes, 'g', ['codebuddy_glm-5.2'])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'g', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await res.text()
+
+    // Changing the scheduling says nothing about the members, so it must not
+    // erase what the scoreboard knows about them.
+    assert.equal((await callSettings(settingsRoutes, 'updateGroup', { id: 'g', strategy: 'round-robin', retry429: 1 })).ok, true)
+    assert.equal(statsRow(await callSettings(settingsRoutes, 'listGroups'), 'g', 'codebuddy_glm-5.2').answered, 1)
+  })
+})
+
 console.log(failures === 0 ? '\nAll gateway translation tests passed.' : `\n${failures} test(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

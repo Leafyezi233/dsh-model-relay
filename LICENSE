@@ -1,3 +1,13 @@
+Copyright 2026 qilin-zhu (original author) and Leafyezi233 (fork maintainer)
+
+This is a modified fork of https://github.com/qilin-zhu/dsh-model-relay,
+which is itself licensed under the Apache License, Version 2.0 reproduced
+below. Changes made in this fork are listed in the repository's git history;
+the substantial ones are: the package is republished under the
+`@leaf233` scope, it supports DSH 0.1.2-rc.1 in addition to the versions the
+original supported, it adds model groups with per-group scheduling and
+rate-limit retries, and it adds per-candidate call statistics.
+
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/
@@ -186,7 +196,7 @@
       same "printed page" as the copyright notice for easier
       identification within third-party archives.
 
-   Copyright [yyyy] [name of copyright owner]
+   Copyright 2026 qilin-zhu (original author) and Leafyezi233 (fork maintainer)
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
