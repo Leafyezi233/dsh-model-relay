@@ -4,13 +4,13 @@
 
 给 DeepSeek Harness 挂一个 OpenAI 兼容的 `/v1` 接口，把 harness 里已注册的大模型（比如 `@tnnevol/dsh-codebuddy` 里的 CodeBuddy 模型）反代出去，其他项目用标准 OpenAI 客户端就能调用。
 
-在 **设置 → 模型中转站** 里可以看到所有接口地址、创建和管理 API 密钥、开关鉴权、查看可用模型。
+在 **设置 → 模型中转站** 里可以看到所有接口地址、分组、创建和管理 API 密钥、开关鉴权、查看可用模型。
 
 ## 为什么不是"再登一次"
 
-这个插件**不碰任何凭据**。它自己不读、不存、不刷新 token，而是把请求交给 DSH 的 `llm` 服务转发——也就是直接复用已注册的 provider 适配器。
+这个插件**不碰任何凭据**。它自己不会读写token等，而是把请求交给 DSH 的 `llm` 服务转发——也就是直接复用已注册的 provider 适配器。
 
-这不是风格偏好，是正确性要求：CodeBuddy 的 refresh token 会轮换，而且 `@tnnevol/dsh-codebuddy` 内部用**单飞（single-flight）** 保证并发刷新只发生一次。如果本插件自己再建一个 session，两次刷新会互相作废，结果是 Web 界面里的登录被踢掉。走 `ctx.llm` 就不可能出现这种情况。
+这是因为一些事实性存在的问题：CodeBuddy 的 refresh token 会轮换，而且 `@tnnevol/dsh-codebuddy` 内部用**单飞（single-flight）** 保证并发刷新只发生一次。如果本插件自己再建一个 session，两次刷新会互相作废，结果是 Web 界面里的登录被踢掉。走 `ctx.llm` 就不可能出现这种情况。
 
 由此还顺带复用了上游插件的账号故障转移、额度感知、图片序列化和模型目录。
 
@@ -74,11 +74,11 @@ http://127.0.0.1:3080/v1
 
 > **这个 fork 用 `@leaf233` 作用域名，不是上游的 `dsh-model-relay`。**
 >
-> npm 上那个**不带 scope 的 `dsh-model-relay` 属于上游作者**（maintainer `jarvistop`，仓库 `qilin-zhu/dsh-model-relay`），本 fork 无权发布它，而且它只到 **0.1.1**、与本仓库代码不同步：0.1.1 用的是旧版 DSH 插件 API，在 `0.1.2-rc.1` 上会直接崩（详见下文「DSH 版本支持」）。
+> npm 上那个**不带 scope 的 `dsh-model-relay` 属于上游作者**（maintainer `jarvistop`，仓库 `qilin-zhu/dsh-model-relay`），本 fork 无权发布它，而且它在 `0.1.2-rc.1` 上会直接崩（详见下文「DSH 版本支持」）。
 >
-> 所以认准 **`@leaf233/dsh-model-relay`**（本 fork）。`@leaf233` 下已有本仓库作者的另一个插件 `@leaf233/dsh-llm-rate-limiter`。
+> 所以如果需要版本支持或上游不一样的功能，需要使用 **`@leaf233/dsh-model-relay`**（本 fork）。
 >
-> **注意区分三个名字**，它们故意不一样：
+> **注意区分三个名字**
 >
 > | 名字 | 值 | 用途 |
 > |---|---|---|
