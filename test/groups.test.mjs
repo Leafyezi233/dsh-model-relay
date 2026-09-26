@@ -162,14 +162,15 @@ await test('the persisted file is valid JSON with a versioned shape', async () =
     const store = new GatewayGroupStore({ file })
     await store.create('g', ['a_b'])
     const parsed = JSON.parse(await readFile(file, 'utf8'))
-    // Bumped when scheduling was added. The version is descriptive only —
-    // 'load' never reads it — so an older plugin reading this file ignores the
-    // new fields rather than refusing the document.
-    assert.equal(parsed.version, 2)
+    // Bumped when scheduling was added, and again when group kinds were. The
+    // version is descriptive only — 'load' never reads it — so an older plugin
+    // reading this file ignores the new fields rather than refusing it.
+    assert.equal(parsed.version, 3)
     assert.equal(Array.isArray(parsed.groups), true)
     assert.equal(parsed.groups[0].name, 'g')
     assert.equal(parsed.groups[0].strategy, 'sequential')
     assert.equal(parsed.groups[0].retry429, 0)
+    assert.equal(parsed.groups[0].kind, 'model')
   })
 })
 
@@ -266,6 +267,94 @@ await test('update changes scheduling, and omitting it preserves the current pai
     const changed = await store.get('g')
     assert.equal(changed.strategy, 'round-robin')
     assert.equal(changed.retry429, 3)
+  })
+})
+
+await test('a group defaults to the model kind, and composite is stored', async () => {
+  await withStore(async (file) => {
+    const store = new GatewayGroupStore({ file })
+    const plain = await store.create('plain', ['a_b'])
+    assert.equal(plain.group.kind, 'model', 'the default must not grant the ability to contain groups')
+    assert.equal((await store.get('plain')).kind, 'model')
+
+    await store.create('inner', ['a_b'])
+    const composite = await store.create('outer', ['dsh-model-relay_inner'], { kind: 'composite' })
+    assert.equal(composite.ok, true, composite.error)
+    assert.equal(composite.group.kind, 'composite')
+
+    const reopened = new GatewayGroupStore({ file })
+    assert.equal((await reopened.get('outer')).kind, 'composite', 'the kind must survive a reload')
+  })
+})
+
+await test('an unusable stored kind degrades to model rather than to composite', async () => {
+  await withStore(async (file) => {
+    await writeFile(file, JSON.stringify({
+      version: 3,
+      groups: [{ name: 'a', models: ['m_n'], kind: 'nonsense' }, { name: 'b', models: ['m_n'] }],
+    }), 'utf8')
+    const store = new GatewayGroupStore({ file })
+    // Degrading to composite would GRANT the capability to a document that
+    // failed to declare itself, which is the direction an attacker would want.
+    assert.equal((await store.get('a')).kind, 'model')
+    assert.equal((await store.get('b')).kind, 'model')
+  })
+})
+
+await test('a model group refuses a candidate that names an existing group', async () => {
+  await withStore(async (file) => {
+    const store = new GatewayGroupStore({ file })
+    await store.create('inner', ['a_b'])
+    const refused = await store.create('plain', ['inner'])
+    assert.equal(refused.ok, false)
+    assert.match(refused.error, /分组名/)
+    // And an update cannot smuggle one in either.
+    assert.equal((await store.update('plain', { models: ['inner'] })).ok, false)
+  })
+})
+
+await test('a composite must point at an existing model group, with the prefix', async () => {
+  await withStore(async (file) => {
+    const store = new GatewayGroupStore({ file })
+    await store.create('inner', ['a_b'])
+
+    assert.equal((await store.create('missing', ['dsh-model-relay_nope'], { kind: 'composite' })).ok, false)
+    // A bare name would resolve to the inner group's FIRST leg only.
+    assert.equal((await store.create('bare', ['inner'], { kind: 'composite' })).ok, false)
+    // Self-reference.
+    assert.equal((await store.create('self', ['dsh-model-relay_self'], { kind: 'composite' })).ok, false)
+    // A composite is not a legal member of a composite: this is what keeps the
+    // reference graph bipartite, and therefore what makes "no nesting" follow
+    // from the type rule instead of needing its own check.
+    await store.create('first', ['dsh-model-relay_inner'], { kind: 'composite' })
+    assert.equal((await store.create('second', ['dsh-model-relay_first'], { kind: 'composite' })).ok, false)
+
+    assert.equal((await store.create('good', ['dsh-model-relay_inner'], { kind: 'composite' })).ok, true)
+  })
+})
+
+await test('kind is not updatable, so a caller cannot grant the capability by asking', async () => {
+  await withStore(async (file) => {
+    const store = new GatewayGroupStore({ file })
+    await store.create('g', ['a_b'])
+    await store.update('g', { kind: 'composite' })
+    assert.equal((await store.get('g')).kind, 'model')
+  })
+})
+
+await test('dangling members and referrers are reported without being stored', async () => {
+  await withStore(async (file) => {
+    const store = new GatewayGroupStore({ file })
+    await store.create('inner', ['a_b'])
+    await store.create('outer', ['dsh-model-relay_inner'], { kind: 'composite' })
+    assert.deepEqual((await store.get('outer')).dangling, [])
+
+    await store.remove('inner')
+    const stale = await store.get('outer')
+    assert.deepEqual(stale.dangling, ['dsh-model-relay_inner'])
+    // Derived on read, so it never lands in the document.
+    const onDisk = JSON.parse(await readFile(file, 'utf8'))
+    assert.equal('dangling' in onDisk.groups.find((group) => group.name === 'outer'), false)
   })
 })
 

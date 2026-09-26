@@ -25,6 +25,7 @@ const SUITES = [
   'gateway.test.mjs',
   'keys.test.mjs',
   'groups.test.mjs',
+  'nesting.test.mjs',
   'strategy.test.mjs',
   'stats.test.mjs',
   'client-bundle.test.mjs',
